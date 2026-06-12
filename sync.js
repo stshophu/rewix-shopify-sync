@@ -125,7 +125,15 @@ Return ONLY a valid JSON object — no markdown, no explanation, no backticks:
 
 async function fetchRewixProducts(since = null) {
   const params = new URLSearchParams({ v: 'TEAL', acceptedlocales: LOCALES });
-  if (since) params.set('since', since);
+if (since) {
+    const ageMs = Date.now() - new Date(since).getTime();
+    if (ageMs > 3.5 * 60 * 60 * 1000) {
+      log('Saved timestamp older than Rewix 4h incremental window - falling back to full sync.');
+      since = null;
+    } else {
+      params.set('since', since);
+    }
+  }
 
   const url = `${REWIX_BASE_URL}/restful/export/api/products.json?${params}`;
   log(`Fetching Rewix catalog${since ? ` (changes since ${since})` : ' (full)'}…`);
