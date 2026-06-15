@@ -42,6 +42,29 @@ const warn = (msg) => console.warn(`[${new Date().toISOString()}] ⚠  ${msg}`);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const basicAuth = () => Buffer.from(`${REWIX_API_KEY}:${REWIX_PASSWORD}`).toString('base64');
 
+/**
+ * fetch() wrapper that retries transient failures ("fetch failed" socket
+ * resets, TLS blips, 429s, and 5xx) with exponential backoff. 4xx responses
+ * are returned as-is so the caller can handle them.
+ */
+async function fetchWithRetry(url, opts = {}, { attempts = 4, label = 'request' } = {}) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fetch(url, { ...opts, signal: AbortSignal.timeout(120_000) });
+      if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (i === attempts) break;
+      const wait = Math.min(2 ** i * 1000, 30_000); // 2s, 4s, 8s, …
+      warn(`${label} failed (attempt ${i}/${attempts}): ${err.message} — retrying in ${wait}ms`);
+      await sleep(wait);
+    }
+  }
+  throw lastErr;
+}
+
 // ─── CLAUDE SEO GENERATION ─────────────────────────────────────────────────────
 
 /**
@@ -138,12 +161,12 @@ if (since) {
   const url = `${REWIX_BASE_URL}/restful/export/api/products.json?${params}`;
   log(`Fetching Rewix catalog${since ? ` (changes since ${since})` : ' (full)'}…`);
 
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     headers: {
       Authorization: `Basic ${basicAuth()}`,
       Accept:        'application/json',
     },
-  });
+  }, { label: 'Rewix catalog fetch' });
 
   if (!res.ok) throw new Error(`Rewix API error ${res.status}: ${await res.text()}`);
   const data = await res.json();
@@ -377,13 +400,21 @@ async function run() {
     log('Full catalog sync');
   }
 
+  // Cursor for the NEXT incremental run. Anchor it to wall-clock time (minus a
+  // small overlap) — NOT to rewixData.lastUpdate. The catalog's lastUpdate only
+  // moves when products actually change, so during any quiet period >3.5h every
+  // run would age out of the incremental window and fall back to a full sync
+  // forever. Wall-clock anchoring advances the cursor every run and self-heals.
+  const OVERLAP_MS = 15 * 60 * 1000; // 15-min look-back so mid-run edits aren't missed
+  const syncCursor = new Date(Date.now() - OVERLAP_MS).toISOString();
+
   // Fetch from Rewix
   const rewixData = await fetchRewixProducts(since);
   const products  = rewixData.pageItems || [];
 
   if (products.length === 0) {
     log('No products to sync. Already up to date!');
-    if (rewixData.lastUpdate) fs.writeFileSync(LAST_UPDATE_FILE, rewixData.lastUpdate);
+    fs.writeFileSync(LAST_UPDATE_FILE, syncCursor);
     return;
   }
 
@@ -457,11 +488,9 @@ async function run() {
     await sleep(SHOPIFY_DELAY);
   }
 
-  // Save timestamp for next incremental sync
-  if (rewixData.lastUpdate) {
-    fs.writeFileSync(LAST_UPDATE_FILE, rewixData.lastUpdate);
-    log(`Saved lastUpdate: ${rewixData.lastUpdate}`);
-  }
+  // Save cursor for next incremental sync (wall-clock anchored, see above)
+  fs.writeFileSync(LAST_UPDATE_FILE, syncCursor);
+  log(`Saved sync cursor: ${syncCursor}`);
 
   log(`\n✅  Sync complete — created: ${created} (SEO optimised), updated: ${updated}, failed: ${failed}`);
 }
