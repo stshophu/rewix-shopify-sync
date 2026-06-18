@@ -40,4 +40,4 @@ jobs:
           REWIX_IMAGE_BASE: ${{ secrets.REWIX_IMAGE_BASE }}
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
-        run: node sync.js
+        run: node sync.js --full
