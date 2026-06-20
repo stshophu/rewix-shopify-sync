@@ -1,0 +1,42 @@
+name: Cleanup Orphans and Duplicates (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Type 'apply' to actually archive. Leave blank for a dry run."
+        required: false
+        default: ''
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm install
+
+      - name: Run cleanup script
+        env:
+          REWIX_BASE_URL: ${{ secrets.REWIX_BASE_URL }}
+          REWIX_API_KEY: ${{ secrets.REWIX_API_KEY }}
+          REWIX_PASSWORD: ${{ secrets.REWIX_PASSWORD }}
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.apply }}" = "apply" ]; then
+            node cleanup_orphans_and_duplicates.cjs --apply
+          else
+            node cleanup_orphans_and_duplicates.cjs
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-report
+          path: cleanup_report.csv
