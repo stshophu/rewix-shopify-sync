@@ -206,7 +206,13 @@ function computeVariantPricing(m) {
 function buildSkuFor(m) {
   const sizeRaw = (m.size != null ? String(m.size) : '').trim();
   const sizeSlug = sizeRaw.replace(/\s+/g, '-');
-  let sku = m.code || '';
+  // .trim() here matters: Rewix's API has been observed returning the same
+  // model's `code` with inconsistent leading/trailing whitespace across
+  // separate calls. Untrimmed, the computed SKU differs at the byte level
+  // between runs even though it displays identically in Shopify's UI — so
+  // the matching index never finds the existing product, and sync.js
+  // recreates it as new on every single full sync, forever.
+  let sku = (m.code || '').trim();
   if (sizeSlug && !new RegExp(`-${sizeSlug}$`, 'i').test(sku)) {
     sku = sku ? `${sku}-${sizeSlug}` : sizeSlug;
   }
@@ -608,10 +614,8 @@ async function run() {
           // deduped model list so duplicate feed rows for the same SKU don't
           // fire redundant (and order-dependent) inventory writes.
           for (const m of payload.dedupedModels) {
-            const sizeSlug = (m.size != null ? String(m.size) : '').trim().replace(/\s+/g, '-');
-            const suffixedSku = sizeSlug && !new RegExp(`-${sizeSlug}$`, 'i').test(m.code || '')
-              ? `${m.code}-${sizeSlug}` : m.code;
-            const vid = skuVariantId.get(suffixedSku) || skuVariantId.get(m.code);
+            const suffixedSku = buildSkuFor(m);
+            const vid = skuVariantId.get(suffixedSku) || skuVariantId.get((m.code || '').trim());
             if (vid) {
               const costRaw = m.taxable ?? m.bestTaxable;
               const cost = (costRaw != null && costRaw !== '') ? parseFloat(costRaw) : null;
@@ -651,12 +655,9 @@ async function run() {
           const v = payload.product.variants[mi];
           // Reconstruct the same size-suffixed SKU we write on import, then fall
           // back to bare code (old scheme) and finally the RewixSync model id.
-          const sizeSlug = (m.size != null ? String(m.size) : '').trim().replace(/\s+/g, '-');
-          const suffixedSku = sizeSlug && !new RegExp(`-${sizeSlug}$`, 'i').test(m.code || '')
-            ? `${m.code}-${sizeSlug}`
-            : m.code;
+          const suffixedSku = buildSkuFor(m);
           const vid = skuVariantId.get(suffixedSku)
-                   || skuVariantId.get(m.code)
+                   || skuVariantId.get((m.code || '').trim())
                    || modelIdToData.get(m.id)?.variantId;
           if (vid) {
             await updateVariantPriceOnly(
