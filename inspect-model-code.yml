@@ -1,0 +1,28 @@
+name: Inspect Model Code (Manual, Read-Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      search:
+        description: "Code or title substring to search for (e.g. m4c06t)"
+        required: true
+        default: 'm4c06t'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm install
+
+      - name: Run diagnostic
+        env:
+          REWIX_BASE_URL: ${{ secrets.REWIX_BASE_URL }}
+          REWIX_API_KEY: ${{ secrets.REWIX_API_KEY }}
+          REWIX_PASSWORD: ${{ secrets.REWIX_PASSWORD }}
+        run: node inspect_model_code.cjs "${{ github.event.inputs.search }}"
