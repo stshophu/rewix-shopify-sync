@@ -1,0 +1,27 @@
+name: Delete Duplicate Products (Manual)
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Type 'apply' to actually delete. Leave blank for a dry run."
+        required: false
+        default: ''
+jobs:
+  delete-duplicates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - name: Run delete duplicates script
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.apply }}" = "apply" ]; then
+            node delete_duplicates.cjs --apply
+          else
+            node delete_duplicates.cjs
+          fi
