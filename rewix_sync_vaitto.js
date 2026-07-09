@@ -32,9 +32,9 @@ const basicAuth = () => Buffer.from(`${process.env.REWIX_API_KEY}:${process.env.
 
 // ── Taxonomy maps ──────────────────────────────────────────────────────────────
 const CATEGORY_IDS = {
-  'Clothing':'7ce80cf0-8abc-4012-9856-4ae3577010a8','Shoes':'269335d1-6456-4877-a212-76828272dc2f',
-  'Bags':'50cd953d-522d-4c50-b87b-915a05f1022d','Accessories':'9f1faf56-7d36-443f-8366-c2c5e4512091',
-  'Jewelry':'4516c76f-cab0-4cb1-814c-3cfbf06f3618',
+  'Clothing':'9ad0fa3b-6630-4191-ad42-833a3416fde0','Shoes':'99f535ee-1331-4cb5-b963-2d831d13ef92',
+  'Bags':'ff381def-e899-4964-92db-8e7c25c2a7fc','Accessories':'56e164a3-7815-4436-bf92-f3399b4047a4',
+  'Jewelry':'eff88827-38ad-4d6e-a693-56a66650ee43',
 };
 const SUBCATEGORY_IDS = {
   'Jackets':'0f6e4894-6090-492a-a85b-fee97f92a613','Dresses':'d4e7d2fc-d19b-4e73-a9ad-a39e9025eb3e',
