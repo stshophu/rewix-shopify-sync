@@ -1,20 +1,36 @@
 /**
  * Rewix → Vaitto  (Romanelli / EU-WAR-1)
+ * Uses direct Postgres connection via pg library — no Supabase REST.
+ *
  * Env vars: REWIX_BASE_URL, REWIX_API_KEY, REWIX_PASSWORD, REWIX_IMAGE_BASE,
- *           VAITTO_SUPABASE_URL, VAITTO_SUPABASE_SERVICE_KEY, VAITTO_DRY_RUN
+ *           VAITTO_DB_URL, VAITTO_DRY_RUN
  * Usage: node rewix_sync_vaitto.js [--full]
  */
 require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
+const { Client } = require('pg');
+
 const repoPath = process.env.REWIX_REPO_PATH || __dirname;
 const { buildTitle, translateCategory, translateSubcategory,
         normalizeSeason, normalizeGender } = require(path.join(repoPath, 'translate.cjs'));
 
 const SUPPLIER_ID = '34e860f0-67ac-48b7-9df9-a16043e8bede';
-const SB_URL      = (process.env.VAITTO_SUPABASE_URL || '').replace(/\/$/, '');
+const DB_URL      = process.env.VAITTO_DB_URL;
+const DRY_RUN     = process.env.VAITTO_DRY_RUN === '1';
+const REWIX_BASE  = process.env.REWIX_BASE_URL;
+const REWIX_IMG   = process.env.REWIX_IMAGE_BASE || REWIX_BASE;
+const LAST_FILE   = path.join(__dirname, '.rewix_vaitto_last_sync');
+const LOCALES     = 'en_US,de_DE';
 
-// ── Taxonomy maps (subcategory string → Vaitto UUID) ──────────────────────────
+if (!DB_URL) { console.error('Missing VAITTO_DB_URL'); process.exit(1); }
+
+const log  = m => console.log(`[${new Date().toISOString()}] ${m}`);
+const warn = m => console.warn(`[${new Date().toISOString()}] ⚠  ${m}`);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const basicAuth = () => Buffer.from(`${process.env.REWIX_API_KEY}:${process.env.REWIX_PASSWORD}`).toString('base64');
+
+// ── Taxonomy maps ──────────────────────────────────────────────────────────────
 const CATEGORY_IDS = {
   'Clothing':'7ce80cf0-8abc-4012-9856-4ae3577010a8','Shoes':'269335d1-6456-4877-a212-76828272dc2f',
   'Bags':'50cd953d-522d-4c50-b87b-915a05f1022d','Accessories':'9f1faf56-7d36-443f-8366-c2c5e4512091',
@@ -69,87 +85,44 @@ const GENDER_MAP = {
   'unisex':'Unisex','kids':'Kids','junior':'Kids',
 };
 
-// Brand cache loaded at start
-let _brands = new Map(); // name.lower → uuid
-let _unknownBrandId = null;
-
-async function loadBrands() {
-  const r = await sbReq('GET', 'brands', { params: { select: 'id,name', limit: '2000' } });
-  if (r?.ok) {
-    const rows = await r.json();
-    for (const row of rows) {
-      _brands.set(row.name.trim().toLowerCase(), row.id);
-      if (row.name.trim().toLowerCase() === 'unknown') _unknownBrandId = row.id;
-    }
-  }
-  return _brands;
-}
-
-function resolveBrand(name) {
-  if (!name) return _unknownBrandId;
-  return _brands.get(name.trim().toLowerCase()) || _unknownBrandId;
-}
 function resolveCategory(subcat) {
   if (!subcat) return null;
   const k = subcat.trim().toLowerCase();
-  const cat = CAT_MAP[k] || (k.includes('shoe')||k.includes('boot')||k.includes('sneak') ? 'Shoes'
-    : k.includes('bag')||k.includes('clutch')||k.includes('tote') ? 'Bags'
-    : k.includes('jewel')||k.includes('earring')||k.includes('bracelet') ? 'Jewelry'
-    : 'Clothing');
+  const cat = CAT_MAP[k] || (
+    k.includes('shoe')||k.includes('boot')||k.includes('sneak') ? 'Shoes' :
+    k.includes('bag')||k.includes('clutch')||k.includes('tote') ? 'Bags' :
+    k.includes('jewel')||k.includes('earring')||k.includes('bracelet') ? 'Jewelry' :
+    'Clothing');
   return CATEGORY_IDS[cat] || null;
 }
 function resolveSubcategory(subcat) {
   if (!subcat) return null;
-  const k = subcat.trim().toLowerCase();
-  const name = SUB_MAP[k];
+  const name = SUB_MAP[subcat.trim().toLowerCase()];
   return name ? SUBCATEGORY_IDS[name] : null;
 }
 function resolveGender(raw) {
   if (!raw) return null;
   return GENDER_MAP[raw.trim().toLowerCase()] || null;
 }
-const SB_KEY      = process.env.VAITTO_SUPABASE_SERVICE_KEY || '';
-const DRY_RUN     = process.env.VAITTO_DRY_RUN === '1';
-const REWIX_BASE  = process.env.REWIX_BASE_URL;
-const REWIX_IMG   = process.env.REWIX_IMAGE_BASE || REWIX_BASE;
-const LAST_FILE   = path.join(__dirname, '.rewix_vaitto_last_sync');
-const LOCALES     = 'en_US,de_DE';
 
-if (!SB_URL || !SB_KEY) { console.error('Missing Supabase env vars'); process.exit(1); }
-
-const log  = m => console.log(`[${new Date().toISOString()}] ${m}`);
-const warn = m => console.warn(`[${new Date().toISOString()}] ⚠  ${m}`);
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const basicAuth = () => Buffer.from(`${process.env.REWIX_API_KEY}:${process.env.REWIX_PASSWORD}`).toString('base64');
-
-// ── Supabase ───────────────────────────────────────────────────────────────────
-const sbH = () => ({ 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}`,
-                     'Content-Type': 'application/json', 'Prefer': 'return=minimal' });
-
-async function sbReq(method, table, { params = {}, body = null, prefer = 'return=minimal' } = {}) {
-  const url = new URL(`${SB_URL}/rest/v1/${table}`);
-  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, v));
-  for (let i = 0; i < 4; i++) {
-    try {
-      const res = await fetch(url.toString(), {
-        method, headers: { ...sbH(), Prefer: prefer },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (res.status === 429) { await sleep(parseFloat(res.headers.get('Retry-After')||'5')*1000); continue; }
-      if (res.status >= 500)  { await sleep(2**i*1000); continue; }
-      return res;
-    } catch(e) { await sleep(2**i*1000); }
-  }
-  return null;
+// ── DB helpers ─────────────────────────────────────────────────────────────────
+async function loadExisting(db) {
+  const res = await db.query(
+    "SELECT id, vaitto_sku FROM products WHERE supplier_id = $1 AND vaitto_sku IS NOT NULL",
+    [SUPPLIER_ID]
+  );
+  return new Map(res.rows.map(r => [r.vaitto_sku, r.id]));
 }
 
-// ── Load existing ──────────────────────────────────────────────────────────────
-async function loadExisting() {
-  const r = await sbReq('GET', 'products', { params: { supplier_id: `eq.${SUPPLIER_ID}`, select: 'id,vaitto_sku', limit: '10000' } });
-  if (!r?.ok) { warn('Could not load existing products'); return new Map(); }
-  const rows = await r.json();
-  return new Map(rows.filter(r => r.vaitto_sku).map(r => [r.vaitto_sku, r.id]));
+async function loadBrands(db) {
+  const res = await db.query("SELECT id, name FROM brands WHERE active = true");
+  const map = new Map();
+  let unknownId = null;
+  for (const r of res.rows) {
+    map.set(r.name.trim().toLowerCase(), r.id);
+    if (r.name.trim().toLowerCase() === 'unknown') unknownId = r.id;
+  }
+  return { map, unknownId };
 }
 
 // ── Rewix fetch ────────────────────────────────────────────────────────────────
@@ -163,7 +136,10 @@ async function fetchRewix(since) {
   log(`Fetching Rewix${since ? ` (since ${since})` : ' (full)'}…`);
   for (let i = 0; i < 4; i++) {
     try {
-      const res = await fetch(url, { headers: { Authorization: `Basic ${basicAuth()}`, Accept: 'application/json' }, signal: AbortSignal.timeout(120_000) });
+      const res = await fetch(url, {
+        headers: { Authorization: `Basic ${basicAuth()}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(120_000),
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       log(`Rewix: ${data.pageItems?.length ?? 0} products`);
@@ -177,20 +153,21 @@ const tagEN = (tags, key) => { const t = tags?.find(t=>t.name===key); const l = 
 const localized = (locs, f) => { const l = locs?.find(l=>l.locale==='en_US')||locs?.[0]; return l?.[f]||''; };
 const buildSku = m => { const c=(m.code||'').trim(); const s=(m.size||'').trim(); return s?`${c}-${s}`:c; };
 
-function parseProduct(rp) {
+function parseProduct(rp, brandMap, unknownBrandId) {
   const brand    = tagEN(rp.tags,'brand')||'';
   const catRaw   = tagEN(rp.tags,'category')||'';
   const subRaw   = tagEN(rp.tags,'subcategory')||'';
-  const gender   = normalizeGender(tagEN(rp.tags,'gender')||'');
+  const gender   = resolveGender(tagEN(rp.tags,'gender')||'');
   const color    = tagEN(rp.tags,'color')||'';
   const subcat   = translateSubcategory(subRaw);
-  const category = subcat || translateCategory(catRaw) || null;
   const title    = buildTitle({ brand, gender, name: rp.name, color, subcat })
                 || localized(rp.productLocalizations,'productName') || rp.name;
   const desc     = localized(rp.productLocalizations,'description') || null;
   const images   = (rp.images||[]).map(img => img.url.startsWith('http') ? img.url : `${REWIX_IMG}${img.url}`);
+  const brandId  = brandMap.get(brand.trim().toLowerCase()) || unknownBrandId;
+  const categoryId    = resolveCategory(subcat || catRaw);
+  const subcategoryId = resolveSubcategory(subcat || catRaw);
 
-  // Dedupe models by SKU, sum stock
   const seen = new Map();
   for (const m of rp.models||[]) {
     const sku = buildSku(m);
@@ -198,17 +175,13 @@ function parseProduct(rp) {
     else seen.get(sku).availability = (seen.get(sku).availability||0) + (m.availability||0);
   }
   const models    = [...seen.values()];
-  const stockQty  = models.reduce((s,m) => s + (parseInt(m.availability||0)), 0);
+  const stockQty  = models.reduce((s,m) => s + parseInt(m.availability||0), 0);
   const ref       = models.find(m => (m.availability||0) > 0) || models[0] || {};
   const cost      = ref.taxable != null ? parseFloat(ref.taxable) : null;
   const rrp       = ref.streetPrice != null ? parseFloat(ref.streetPrice) : null;
   const productSku = (models[0]?.code||'').trim() || String(rp.id);
 
-  const categoryId    = resolveCategory(subcat || category);
-  const subcategoryId = resolveSubcategory(subcat || category);
-  const genderResolved = resolveGender(gender);
-  const brandId = resolveBrand(brand);
-  return { productSku, title, desc, categoryId, subcategoryId, genderResolved, brandId, cost, rrp, stockQty, images };
+  return { productSku, title, desc, categoryId, subcategoryId, gender, brandId, cost, rrp, stockQty, images };
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
@@ -217,63 +190,85 @@ async function main() {
   log(`🚀  Rewix → Vaitto  ${new Date().toISOString()}`);
   if (DRY_RUN) log('  [DRY RUN]');
 
-  const full  = process.argv.includes('--full');
-  const since = !full && fs.existsSync(LAST_FILE) ? fs.readFileSync(LAST_FILE,'utf8').trim() : null;
-  const cursor = new Date(Date.now() - 15*60*1000).toISOString();
+  const db = new Client({ connectionString: DB_URL, connectionTimeoutMillis: 15000 });
+  await db.connect();
+
+  const full    = process.argv.includes('--full');
+  const since   = !full && fs.existsSync(LAST_FILE) ? fs.readFileSync(LAST_FILE,'utf8').trim() : null;
+  const cursor  = new Date(Date.now() - 15*60*1000).toISOString();
 
   const data     = await fetchRewix(since);
   const products = data.pageItems || [];
-  if (!products.length) { log('Nothing to sync'); fs.writeFileSync(LAST_FILE, cursor); return; }
+  if (!products.length) { log('Nothing to sync'); if (!DRY_RUN) fs.writeFileSync(LAST_FILE, cursor); await db.end(); return; }
 
-  await loadBrands();
-  log(`  ${_brands.size} brands loaded`);
-  const existing = await loadExisting();
-  log(`  ${existing.size} existing products`);
+  const existing           = await loadExisting(db);
+  const { map: brandMap, unknownId } = await loadBrands(db);
+  log(`  ${existing.size} existing · ${brandMap.size} brands`);
 
   const counts = { created:0, updated:0, deactivated:0, skipped:0, errors:0 };
 
   for (let i = 0; i < products.length; i++) {
     const rp = products[i];
     let parsed;
-    try { parsed = parseProduct(rp); } catch(e) { warn(`Parse error ${rp.id}: ${e.message}`); counts.errors++; continue; }
-    const { productSku, title, desc, categoryId, subcategoryId, genderResolved, brandId, cost, rrp, stockQty, images } = parsed;
+    try { parsed = parseProduct(rp, brandMap, unknownId); }
+    catch(e) { warn(`Parse error ${rp.id}: ${e.message}`); counts.errors++; continue; }
+
+    const { productSku, title, desc, categoryId, subcategoryId, gender,
+            brandId, cost, rrp, stockQty, images } = parsed;
     const isNew = !existing.has(productSku);
     log(`[${i+1}/${products.length}]  ${productSku}  '${title}'  stock=${stockQty}`);
 
     if (isNew && stockQty === 0) { counts.skipped++; continue; }
 
     if (!isNew && stockQty === 0) {
-      if (!DRY_RUN) await sbReq('PATCH','products',{ params:{id:`eq.${existing.get(productSku)}`}, body:{active:false,stock_qty:0} });
+      if (!DRY_RUN) {
+        await db.query("UPDATE products SET active = false, stock_qty = 0 WHERE id = $1", [existing.get(productSku)]);
+      }
       log(`  🔴 DEACTIVATED`); counts.deactivated++; continue;
     }
 
     const slug = `${SUPPLIER_ID.slice(0,8)}-${productSku}`.toLowerCase().replace(/\s+/g,'-').slice(0,200);
-    const body = {
-      supplier_id: SUPPLIER_ID, brand_id: brandId, vaitto_sku: productSku,
-      name: title, slug, category_id: categoryId, subcategory_id: subcategoryId,
-      gender: genderResolved, description: desc||'',
-      supplier_price: cost ? Math.round(cost*100)/100 : null,
-      rrp:  rrp  ? Math.round(rrp*100)/100  : null,
-      stock_qty: stockQty, active: true, dropship_available: true,
-      image_url: images[0]||null,
-      images: images.slice(0,10).map(u=>({url:u})),
-    };
+    const imagesJson = JSON.stringify(images.slice(0,10).map(u=>({url:u})));
 
     if (DRY_RUN) { log(`  [DRY RUN] ${isNew?'CREATE':'UPDATE'}`); continue; }
 
-    if (isNew) {
-      const r = await sbReq('POST','products',{ body, prefer:'return=representation' });
-      if (r?.ok) { const d=await r.json(); existing.set(productSku,(Array.isArray(d)?d[0]:d).id); log(`  ✅ CREATED`); counts.created++; }
-      else { warn(`CREATE failed: ${r?.status}`); counts.errors++; }
-    } else {
-      const { slug:_s, vaitto_sku:_v, ...upd } = body;
-      const r = await sbReq('PATCH','products',{ params:{id:`eq.${existing.get(productSku)}`}, body:upd });
-      if (r && [200,204].includes(r.status)) { log(`  🔄 UPDATED`); counts.updated++; }
-      else { warn(`UPDATE failed: ${r?.status}`); counts.errors++; }
-    }
-    await sleep(80);
+    try {
+      if (isNew) {
+        const res = await db.query(`
+          INSERT INTO products (
+            supplier_id, vaitto_sku, name, slug, brand_id,
+            category_id, subcategory_id, gender, description,
+            supplier_price, rrp, stock_qty, active, dropship_available,
+            image_url, images
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true,true,$13,$14)
+          RETURNING id`,
+          [SUPPLIER_ID, productSku, title, slug, brandId,
+           categoryId, subcategoryId, gender, desc||'',
+           cost, rrp, stockQty,
+           images[0]||null, imagesJson]
+        );
+        existing.set(productSku, res.rows[0].id);
+        log(`  ✅ CREATED`); counts.created++;
+      } else {
+        await db.query(`
+          UPDATE products SET
+            name=$1, brand_id=$2, category_id=$3, subcategory_id=$4,
+            gender=$5, description=$6, supplier_price=$7, rrp=$8,
+            stock_qty=$9, active=true, image_url=$10, images=$11
+          WHERE id=$12`,
+          [title, brandId, categoryId, subcategoryId,
+           gender, desc||'', cost, rrp,
+           stockQty, images[0]||null, imagesJson,
+           existing.get(productSku)]
+        );
+        log(`  🔄 UPDATED`); counts.updated++;
+      }
+    } catch(e) { warn(`DB error ${productSku}: ${e.message}`); counts.errors++; }
+
+    await sleep(50);
   }
 
+  await db.end();
   if (!DRY_RUN) fs.writeFileSync(LAST_FILE, cursor);
   log(`\n  ✅${counts.created} created  🔄${counts.updated} updated  🔴${counts.deactivated} deactivated  ⏭${counts.skipped} skipped  ❌${counts.errors} errors`);
   log('═'.repeat(50));
