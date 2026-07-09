@@ -2,7 +2,7 @@ name: Rewix → Vaitto (Romanelli EU-WAR-1)
 
 on:
   schedule:
-    - cron: '20 * * * *'  # every hour at :20
+    - cron: '20 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -11,15 +11,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
+      - run: npm install pg
       - name: Run sync
         env:
-          REWIX_BASE_URL:               ${{ secrets.REWIX_BASE_URL }}
-          REWIX_API_KEY:                ${{ secrets.REWIX_API_KEY }}
-          REWIX_PASSWORD:               ${{ secrets.REWIX_PASSWORD }}
-          REWIX_IMAGE_BASE:             ${{ secrets.REWIX_IMAGE_BASE }}
-          REWIX_REPO_PATH:              '.'
-          VAITTO_SUPABASE_URL:          ${{ secrets.VAITTO_SUPABASE_URL }}
-          VAITTO_SUPABASE_SERVICE_KEY:  ${{ secrets.VAITTO_SUPABASE_SERVICE_KEY }}
+          REWIX_BASE_URL:   ${{ secrets.REWIX_BASE_URL }}
+          REWIX_API_KEY:    ${{ secrets.REWIX_API_KEY }}
+          REWIX_PASSWORD:   ${{ secrets.REWIX_PASSWORD }}
+          REWIX_IMAGE_BASE: ${{ secrets.REWIX_IMAGE_BASE }}
+          REWIX_REPO_PATH:  '.'
+          VAITTO_DB_URL:    ${{ secrets.VAITTO_DB_URL }}
           # VAITTO_DRY_RUN: '1'
         run: node rewix_sync_vaitto.js
