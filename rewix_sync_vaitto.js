@@ -13,7 +13,7 @@ const { Client } = require('pg');
 
 const repoPath = process.env.REWIX_REPO_PATH || __dirname;
 const { buildTitle, translateCategory, translateSubcategory,
-        normalizeSeason, normalizeGender } = require(path.join(repoPath, 'translate.cjs'));
+        normalizeSeason, normalizeGender } = require(path.resolve(repoPath, 'translate.cjs'));
 
 const SUPPLIER_ID = '34e860f0-67ac-48b7-9df9-a16043e8bede';
 const DB_URL      = process.env.VAITTO_DB_URL;
