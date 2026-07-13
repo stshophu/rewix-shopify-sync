@@ -157,6 +157,7 @@ const localized = (locs, f) => {
 };
 const buildSku = m => { const c=(m.code||'').trim(); const s=(m.size||'').trim(); return s?`${c}-${s}`:c; };
 
+let _debuggedBadTitle = false;
 function parseProduct(rp, brandMap, unknownBrandId) {
   const brand    = tagEN(rp.tags,'brand')||'';
   const catRaw   = tagEN(rp.tags,'category')||'';
@@ -166,6 +167,10 @@ function parseProduct(rp, brandMap, unknownBrandId) {
   const subcat   = translateSubcategory(subRaw);
   const title    = buildTitle({ brand, gender, name: rp.name, color, subcat })
                 || localized(rp.productLocalizations,'productName') || rp.name;
+  if (!_debuggedBadTitle && typeof title !== 'string') {
+    _debuggedBadTitle = true;
+    console.log('[DEBUG] non-string title for', rp.id, JSON.stringify(rp.productLocalizations), '| rp.name:', JSON.stringify(rp.name));
+  }
   const desc     = localized(rp.productLocalizations,'description') || null;
   const images   = (rp.images||[]).map(img => img.url.startsWith('http') ? img.url : `${REWIX_IMG}${img.url}`);
   const brandId  = brandMap.get(brand.trim().toLowerCase()) || unknownBrandId;
