@@ -150,7 +150,11 @@ async function fetchRewix(since) {
 
 // ── Parse helpers ──────────────────────────────────────────────────────────────
 const tagEN = (tags, key) => { const t = tags?.find(t=>t.name===key); const l = t?.localizations?.find(l=>l.locale==='en_US')||t?.localizations?.[0]; return l?.value||null; };
-const localized = (locs, f) => { const l = locs?.find(l=>l.locale==='en_US')||locs?.[0]; return l?.[f]||''; };
+const localized = (locs, f) => {
+  const arr = Array.isArray(locs) ? locs : (locs ? [locs] : []);
+  const l = arr.find(l => l.locale === 'en_US') || arr[0];
+  return l?.[f] || '';
+};
 const buildSku = m => { const c=(m.code||'').trim(); const s=(m.size||'').trim(); return s?`${c}-${s}`:c; };
 
 function parseProduct(rp, brandMap, unknownBrandId) {
