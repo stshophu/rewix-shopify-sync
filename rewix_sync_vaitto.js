@@ -205,6 +205,11 @@ async function main() {
   const products = data.pageItems || [];
   if (!products.length) { log('Nothing to sync'); if (!DRY_RUN) fs.writeFileSync(LAST_FILE, cursor); await db.end(); return; }
 
+  // TEMP DEBUG — remove after checking tag names
+  console.log('─── DEBUG: raw tags for first product ───');
+  console.log(JSON.stringify(products[0].tags, null, 2));
+  console.log('──────────────────────────────────────────');
+
   const existing           = await loadExisting(db);
   const { map: brandMap, unknownId } = await loadBrands(db);
   log(`  ${existing.size} existing · ${brandMap.size} brands`);
