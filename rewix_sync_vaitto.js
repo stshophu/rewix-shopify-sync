@@ -149,7 +149,11 @@ async function fetchRewix(since) {
 }
 
 // ── Parse helpers ──────────────────────────────────────────────────────────────
-const tagEN = (tags, key) => { const t = tags?.find(t=>t.name===key); const l = t?.localizations?.find(l=>l.locale==='en_US')||t?.localizations?.[0]; return l?.value||null; };
+const tagEN = (tags, key) => {
+  const t = tags?.find(t => t.name === key);
+  if (!t) return null;
+  return t.value?.localeValues?.en_US?.value || t.value?.value || null;
+};
 const localized = (locs, f) => {
   const arr = Array.isArray(locs) ? locs : (locs ? [locs] : []);
   const l = arr.find(l => l.locale === 'en_US') || arr[0];
