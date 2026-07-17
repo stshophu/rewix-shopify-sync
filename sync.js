@@ -44,8 +44,8 @@ const LAST_UPDATE_FILE     = path.join(__dirname, '.last_sync_timestamp');
 const LAST_FULL_COUNT_FILE = path.join(__dirname, '.last_full_sync_count');
 const SHOPIFY_API_VERSION  = '2024-01';
 
-// Delays to stay within API rate limits
-const SHOPIFY_DELAY   = 600;  // ms between Shopify calls (~100/min)
+// (Per-call Shopify spacing is now handled centrally by shopifyFetch() below,
+// not by a fixed delay here.)
 
 // If a --full Rewix pull returns fewer than this fraction of the products
 // seen on the last full run, treat it as a probable feed/API problem rather
@@ -379,6 +379,33 @@ const shopifyHeaders = () => ({
   'X-Shopify-Access-Token': SHOPIFY_TOKEN,
 });
 
+// Shopify's REST Admin API enforces a hard 2 requests/second cap per app.
+// The old code sprinkled small sleeps (150ms, 200ms, 600ms) between *some*
+// calls, but a single variant update can fire 4 separate Shopify calls
+// (price PUT, variant GET, cost PUT, inventory POST) — nowhere near enough
+// spacing to stay under 500ms/call, which is why "Variant price update
+// failed: Exceeded 2 calls per second" was showing up on nearly every
+// variant. This throttle serializes every Shopify call through one queue,
+// regardless of which function makes it, guaranteeing >=550ms between any
+// two consecutive calls. All the old scattered sleeps are removed below —
+// this single choke point replaces them.
+const SHOPIFY_MIN_CALL_GAP = 550; // ms — safety margin over the 500ms (2/sec) cap
+let lastShopifyCallAt   = 0;
+let shopifyCallQueue    = Promise.resolve();
+
+function shopifyFetch(url, opts = {}) {
+  const run = async () => {
+    const wait = lastShopifyCallAt + SHOPIFY_MIN_CALL_GAP - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastShopifyCallAt = Date.now();
+    return fetch(url, opts);
+  };
+  const result = shopifyCallQueue.then(run, run);
+  // Keep the queue alive even if this particular call throws/rejects.
+  shopifyCallQueue = result.then(() => {}, () => {});
+  return result;
+}
+
 async function loadShopifyIndex() {
   log('Building Shopify product index (this may take a moment for large catalogs)…');
 
@@ -402,7 +429,7 @@ async function loadShopifyIndex() {
 
   let url = `${shopifyBase()}/products.json?limit=250&fields=id,variants,tags,status`;
   while (url) {
-    const res = await fetch(url, { headers: shopifyHeaders() });
+    const res = await shopifyFetch(url, { headers: shopifyHeaders() });
     if (!res.ok) throw new Error(`Shopify index error: ${res.status}`);
     const data = await res.json();
     for (const p of data.products || []) {
@@ -427,7 +454,6 @@ async function loadShopifyIndex() {
     const link = res.headers.get('Link') || '';
     const next = link.match(/<([^>]+)>;\s*rel="next"/)?.[1];
     url = next || null;
-    if (url) await sleep(SHOPIFY_DELAY);
   }
 
   const rewixSyncCount = modelIdToData.size;
@@ -436,7 +462,7 @@ async function loadShopifyIndex() {
 }
 
 async function createShopifyProduct(payload) {
-  const res = await fetch(`${shopifyBase()}/products.json`, {
+  const res = await shopifyFetch(`${shopifyBase()}/products.json`, {
     method: 'POST', headers: shopifyHeaders(), body: JSON.stringify(payload),
   });
   if (!res.ok) {
@@ -459,7 +485,7 @@ async function createShopifyProduct(payload) {
 async function updateVariantPriceOnly(variantId, price, compareAt) {
   const variant = { id: variantId, price: price.toFixed(2) };
   if (compareAt) variant.compare_at_price = compareAt.toFixed(2);
-  const res = await fetch(`${shopifyBase()}/variants/${variantId}.json`, {
+  const res = await shopifyFetch(`${shopifyBase()}/variants/${variantId}.json`, {
     method: 'PUT', headers: shopifyHeaders(),
     body: JSON.stringify({ variant }),
   });
@@ -486,7 +512,7 @@ async function reactivateIfPriceResolved(productId, currentTags, stillFlagged) {
     .split(',').map(t => t.trim())
     .filter(t => t && !/^(needs-price-review|rewix-unprofitable)$/i.test(t))
     .join(', ');
-  const res = await fetch(`${shopifyBase()}/products/${productId}.json`, {
+  const res = await shopifyFetch(`${shopifyBase()}/products/${productId}.json`, {
     method: 'PUT', headers: shopifyHeaders(),
     body: JSON.stringify({ product: { id: productId, status: 'active', tags: cleanedTags } }),
   });
@@ -524,7 +550,7 @@ async function reactivateIfBackInStock(productId, currentTags, hasStock) {
   const wasOOS = (currentTags || '').split(',').map(t => t.trim().toLowerCase()).includes(OOS_TAG);
   if (!wasOOS || !hasStock) return false;
   const cleanedTags = removeTag(currentTags, OOS_TAG);
-  const res = await fetch(`${shopifyBase()}/products/${productId}.json`, {
+  const res = await shopifyFetch(`${shopifyBase()}/products/${productId}.json`, {
     method: 'PUT', headers: shopifyHeaders(),
     body: JSON.stringify({ product: { id: productId, published_at: new Date().toISOString(), tags: cleanedTags } }),
   });
@@ -566,7 +592,7 @@ async function cleanupStaleProducts(rewixSkusSeen, { skuData, productMeta }, war
     try {
       for (const v of variants) {
         if (v.inventoryItemId && warehouseLocationId) {
-          await fetch(`${shopifyBase()}/inventory_levels/set.json`, {
+          await shopifyFetch(`${shopifyBase()}/inventory_levels/set.json`, {
             method: 'POST', headers: shopifyHeaders(),
             body: JSON.stringify({
               inventory_item_id: v.inventoryItemId,
@@ -574,12 +600,11 @@ async function cleanupStaleProducts(rewixSkusSeen, { skuData, productMeta }, war
               available:         0,
             }),
           });
-          await sleep(SHOPIFY_DELAY);
         }
       }
 
       const currentTags = productMeta.get(productId)?.tags || '';
-      const res = await fetch(`${shopifyBase()}/products/${productId}.json`, {
+      const res = await shopifyFetch(`${shopifyBase()}/products/${productId}.json`, {
         method: 'PUT', headers: shopifyHeaders(),
         body: JSON.stringify({
           product: { id: productId, published_at: null, tags: addTag(currentTags, OOS_TAG) },
@@ -593,7 +618,6 @@ async function cleanupStaleProducts(rewixSkusSeen, { skuData, productMeta }, war
         log(`  🗑 Zeroed + unpublished (not in Rewix feed): product ${productId} [${variants.map(v => v.sku).join(', ')}]`);
         zeroedOut++;
       }
-      await sleep(SHOPIFY_DELAY);
     } catch (err) {
       warn(`Cleanup error for product ${productId}: ${err.message}`);
       failed++;
@@ -604,7 +628,7 @@ async function cleanupStaleProducts(rewixSkusSeen, { skuData, productMeta }, war
 }
 
 async function updateVariantInventory(variantId, quantity, cost = null, locationId = null) {
-  const vRes = await fetch(`${shopifyBase()}/variants/${variantId}.json`, { headers: shopifyHeaders() });
+  const vRes = await shopifyFetch(`${shopifyBase()}/variants/${variantId}.json`, { headers: shopifyHeaders() });
   if (!vRes.ok) return;
   const { variant } = await vRes.json();
 
@@ -612,17 +636,16 @@ async function updateVariantInventory(variantId, quantity, cost = null, location
   // This is the real Rewix cost (taxable) we already used to compute the price,
   // so margin reporting in Shopify matches what sync actually charged.
   if (cost != null && Number.isFinite(cost) && cost > 0 && variant.inventory_item_id) {
-    await fetch(`${shopifyBase()}/inventory_items/${variant.inventory_item_id}.json`, {
+    await shopifyFetch(`${shopifyBase()}/inventory_items/${variant.inventory_item_id}.json`, {
       method: 'PUT', headers: shopifyHeaders(),
       body: JSON.stringify({ inventory_item: { id: variant.inventory_item_id, cost: cost.toFixed(2) } }),
     });
-    await sleep(150);
   }
 
   // locationId is resolved once per run by the caller and passed in.
   // Fetching /locations.json per-variant added ~12-15 min to every run.
   if (!locationId) {
-    const locRes = await fetch(`${shopifyBase()}/locations.json`, { headers: shopifyHeaders() });
+    const locRes = await shopifyFetch(`${shopifyBase()}/locations.json`, { headers: shopifyHeaders() });
     const { locations } = await locRes.json();
     const location = locations?.find(l => l.name === '3169 Warehouse') || locations?.[0];
     locationId = location?.id;
@@ -632,7 +655,7 @@ async function updateVariantInventory(variantId, quantity, cost = null, location
     return;
   }
 
-  await fetch(`${shopifyBase()}/inventory_levels/set.json`, {
+  await shopifyFetch(`${shopifyBase()}/inventory_levels/set.json`, {
     method: 'POST', headers: shopifyHeaders(),
     body: JSON.stringify({
       inventory_item_id: variant.inventory_item_id,
@@ -710,7 +733,7 @@ async function run() {
   // avoids re-fetching /locations.json on every variant (was adding ~12-15 min/run).
   let warehouseLocationId = null;
   try {
-    const locRes = await fetch(`${shopifyBase()}/locations.json`, { headers: shopifyHeaders() });
+    const locRes = await shopifyFetch(`${shopifyBase()}/locations.json`, { headers: shopifyHeaders() });
     const { locations } = await locRes.json();
     const loc = locations?.find(l => l.name === '3169 Warehouse') || locations?.[0];
     warehouseLocationId = loc?.id || null;
@@ -772,7 +795,6 @@ async function run() {
               const costRaw = m.taxable ?? m.bestTaxable;
               const cost = (costRaw != null && costRaw !== '') ? parseFloat(costRaw) : null;
               await updateVariantInventory(vid, m.availability ?? 0, cost, warehouseLocationId);
-              await sleep(200);
             }
           }
           created++;
@@ -827,7 +849,6 @@ async function run() {
             const costRaw = m.taxable ?? m.bestTaxable;
             const cost = (costRaw != null && costRaw !== '') ? parseFloat(costRaw) : null;
             await updateVariantInventory(vid, m.availability ?? 0, cost, warehouseLocationId);
-            await sleep(200);
           }
         }
         updated++;
@@ -842,8 +863,6 @@ async function run() {
     if ((i + 1) % 10 === 0 || i === products.length - 1) {
       log(`Progress: ${i + 1}/${products.length} | ✅ created:${created} updated:${updated} skipped:${skipped} ❌ failed:${failed}`);
     }
-
-    await sleep(SHOPIFY_DELAY);
   }
 
   // Stale-product cleanup: only on a --full run, and only if the safety
