@@ -32,6 +32,14 @@ jobs:
           restore-keys: |
             sync-timestamp-
 
+      - name: Restore last full-sync count
+        uses: actions/cache@v4
+        with:
+          path: .last_full_sync_count
+          key: full-sync-count-${{ github.run_id }}
+          restore-keys: |
+            full-sync-count-
+
       - name: Run product sync
         env:
           REWIX_BASE_URL: ${{ secrets.REWIX_BASE_URL }}
