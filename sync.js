@@ -7,12 +7,20 @@
  *   category, status, metafields, and images are set once at import and
  *   never overwritten again — manual edits in Shopify persist indefinitely.
  *   Exception: a product auto-drafted for a pricing issue is auto-reactivated
- *   once the feed prices it cleanly (see reactivateIfPriceResolved).
+ *   once the feed prices it cleanly (see reactivateIfPriceResolved), and a
+ *   product zeroed/unpublished by the cleanup below is auto-republished if
+ *   it comes back into stock (see reactivateIfBackInStock).
  * • Incremental sync — only changed products after the first run
+ * • STALE-PRODUCT CLEANUP (--full only): any Rewix-tagged Shopify product
+ *   whose SKU is no longer present in a *full* Rewix catalog pull has its
+ *   inventory zeroed and is unpublished from the Online Store (see
+ *   cleanupStaleProducts). Guarded to full syncs only, and skipped entirely
+ *   if the feed unexpectedly shrinks >50% vs the last full run, so a Rewix
+ *   API blip can't mass-unpublish the store.
  *
  * Usage:
  *   node sync.js          ← smart sync (full first time, incremental after)
- *   node sync.js --full   ← force a full catalog re-download
+ *   node sync.js --full   ← force a full catalog re-download + stale cleanup
  */
 
 require('dotenv').config();
@@ -31,12 +39,19 @@ const REWIX_IMAGE_BASE = process.env.REWIX_IMAGE_BASE || REWIX_BASE_URL;
 const SHOPIFY_STORE    = process.env.SHOPIFY_STORE;
 const SHOPIFY_TOKEN    = process.env.SHOPIFY_TOKEN;
 
-const LOCALES             = 'en_US,de_DE';
-const LAST_UPDATE_FILE    = path.join(__dirname, '.last_sync_timestamp');
-const SHOPIFY_API_VERSION = '2024-01';
+const LOCALES              = 'en_US,de_DE';
+const LAST_UPDATE_FILE     = path.join(__dirname, '.last_sync_timestamp');
+const LAST_FULL_COUNT_FILE = path.join(__dirname, '.last_full_sync_count');
+const SHOPIFY_API_VERSION  = '2024-01';
 
 // Delays to stay within API rate limits
 const SHOPIFY_DELAY   = 600;  // ms between Shopify calls (~100/min)
+
+// If a --full Rewix pull returns fewer than this fraction of the products
+// seen on the last full run, treat it as a probable feed/API problem rather
+// than "half the catalog sold out" and skip the stale-product cleanup for
+// this run (everything else — create/update — still proceeds normally).
+const CLEANUP_DROP_SAFETY = 0.5;
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -380,6 +395,10 @@ async function loadShopifyIndex() {
   const skuVariantId   = new Map();
   const modelIdToData  = new Map();
   const productMeta    = new Map(); // productId -> { tags, status } for manual-hold checks
+  // sku -> { productId, variantId, inventoryItemId, inventoryQuantity } — used
+  // by cleanupStaleProducts() to zero out inventory for products that have
+  // dropped out of a full Rewix feed pull.
+  const skuData        = new Map();
 
   let url = `${shopifyBase()}/products.json?limit=250&fields=id,variants,tags,status`;
   while (url) {
@@ -392,6 +411,12 @@ async function loadShopifyIndex() {
         if (!v.sku) continue;
         if (!skuToProductId.has(v.sku)) skuToProductId.set(v.sku, p.id);
         skuVariantId.set(v.sku, v.id);
+        skuData.set(v.sku, {
+          productId:         p.id,
+          variantId:         v.id,
+          inventoryItemId:   v.inventory_item_id,
+          inventoryQuantity: v.inventory_quantity,
+        });
         // RewixSync app SKU format: "REWIXSYNCRM-{modelId}"
         const match = v.sku.match(/^REWIXSYNCRM-(\d+)$/i);
         if (match) {
@@ -407,7 +432,7 @@ async function loadShopifyIndex() {
 
   const rewixSyncCount = modelIdToData.size;
   log(`Shopify index built: ${skuVariantId.size} variants indexed (${rewixSyncCount} from RewixSync app).`);
-  return { skuToProductId, skuVariantId, modelIdToData, productMeta };
+  return { skuToProductId, skuVariantId, modelIdToData, productMeta, skuData };
 }
 
 async function createShopifyProduct(payload) {
@@ -471,6 +496,111 @@ async function reactivateIfPriceResolved(productId, currentTags, stillFlagged) {
     return false;
   }
   return true;
+}
+
+function addTag(existingTags, newTag) {
+  const tags = (existingTags || '').split(',').map(t => t.trim()).filter(Boolean);
+  if (!tags.some(t => t.toLowerCase() === newTag.toLowerCase())) tags.push(newTag);
+  return tags.join(', ');
+}
+
+function removeTag(existingTags, tagToRemove) {
+  return (existingTags || '')
+    .split(',').map(t => t.trim())
+    .filter(t => t && t.toLowerCase() !== tagToRemove.toLowerCase())
+    .join(', ');
+}
+
+const OOS_TAG = 'rewix-oos';
+
+/**
+ * Reactivates a product previously zeroed/unpublished by cleanupStaleProducts
+ * (tagged OOS_TAG) once it reappears in a Rewix feed pull with real stock.
+ * Mirrors reactivateIfPriceResolved — same "one specific undo" pattern, kept
+ * separate because the two conditions (price fixed vs. back in stock) are
+ * independent and shouldn't be conflated.
+ */
+async function reactivateIfBackInStock(productId, currentTags, hasStock) {
+  const wasOOS = (currentTags || '').split(',').map(t => t.trim().toLowerCase()).includes(OOS_TAG);
+  if (!wasOOS || !hasStock) return false;
+  const cleanedTags = removeTag(currentTags, OOS_TAG);
+  const res = await fetch(`${shopifyBase()}/products/${productId}.json`, {
+    method: 'PUT', headers: shopifyHeaders(),
+    body: JSON.stringify({ product: { id: productId, published_at: new Date().toISOString(), tags: cleanedTags } }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    warn(`Republish failed (${productId}): ${JSON.stringify(err.errors || err)}`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Zeroes inventory + unpublishes every Shopify product tagged 'RewixSync'
+ * whose SKU is absent from a *full* Rewix feed pull. This is the fix for
+ * products that silently drop out of Rewix's export once they hit zero
+ * stock: previously nothing in this script ever noticed they were gone, so
+ * they sat live in Shopify at their last-known quantity forever.
+ *
+ * Caller guarantees this only runs on --full syncs — see run(). manual-hold
+ * products are left completely untouched, same as the normal update path.
+ */
+async function cleanupStaleProducts(rewixSkusSeen, { skuData, productMeta }, warehouseLocationId) {
+  const staleByProduct = new Map(); // productId -> [{sku, variantId, inventoryItemId, inventoryQuantity}]
+
+  for (const [sku, data] of skuData.entries()) {
+    if (rewixSkusSeen.has(sku)) continue;
+    const tags = productMeta.get(data.productId)?.tags || '';
+    if (!tags.split(',').map(t => t.trim().toLowerCase()).includes('rewixsync')) continue; // only Rewix-managed products
+    if (tags.split(',').map(t => t.trim().toLowerCase()).includes('manual-hold')) continue; // respect manual overrides
+    if (!(data.inventoryQuantity > 0)) continue; // already at 0, nothing to do
+    if (!staleByProduct.has(data.productId)) staleByProduct.set(data.productId, []);
+    staleByProduct.get(data.productId).push({ sku, ...data });
+  }
+
+  log(`Stale-product cleanup: ${staleByProduct.size} product(s) no longer in Rewix feed`);
+
+  let zeroedOut = 0, failed = 0;
+  for (const [productId, variants] of staleByProduct.entries()) {
+    try {
+      for (const v of variants) {
+        if (v.inventoryItemId && warehouseLocationId) {
+          await fetch(`${shopifyBase()}/inventory_levels/set.json`, {
+            method: 'POST', headers: shopifyHeaders(),
+            body: JSON.stringify({
+              inventory_item_id: v.inventoryItemId,
+              location_id:       warehouseLocationId,
+              available:         0,
+            }),
+          });
+          await sleep(SHOPIFY_DELAY);
+        }
+      }
+
+      const currentTags = productMeta.get(productId)?.tags || '';
+      const res = await fetch(`${shopifyBase()}/products/${productId}.json`, {
+        method: 'PUT', headers: shopifyHeaders(),
+        body: JSON.stringify({
+          product: { id: productId, published_at: null, tags: addTag(currentTags, OOS_TAG) },
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        warn(`Unpublish failed (${productId}): ${JSON.stringify(err.errors || err)}`);
+        failed++;
+      } else {
+        log(`  🗑 Zeroed + unpublished (not in Rewix feed): product ${productId} [${variants.map(v => v.sku).join(', ')}]`);
+        zeroedOut++;
+      }
+      await sleep(SHOPIFY_DELAY);
+    } catch (err) {
+      warn(`Cleanup error for product ${productId}: ${err.message}`);
+      failed++;
+    }
+  }
+
+  return { zeroedOut, failed };
 }
 
 async function updateVariantInventory(variantId, quantity, cost = null, locationId = null) {
@@ -554,7 +684,27 @@ async function run() {
   }
 
   // Build Shopify index (to detect new vs existing)
-  const { skuToProductId, skuVariantId, modelIdToData, productMeta } = await loadShopifyIndex();
+  const { skuToProductId, skuVariantId, modelIdToData, productMeta, skuData } = await loadShopifyIndex();
+
+  // Safety guard for the stale-product cleanup below: only trust a --full
+  // pull as "this is everything Rewix currently has" if it's roughly the
+  // size we've seen before. A sudden big drop is far more likely to be a
+  // Rewix API/feed problem than half the catalog actually selling out
+  // between two daily runs — so cleanup gets skipped (with a loud warning)
+  // rather than mass-unpublishing the store. create/update still run as normal.
+  let skipCleanup = !forceFullSync;
+  if (forceFullSync) {
+    if (fs.existsSync(LAST_FULL_COUNT_FILE)) {
+      const lastCount = parseInt(fs.readFileSync(LAST_FULL_COUNT_FILE, 'utf8').trim(), 10) || 0;
+      if (lastCount > 0 && products.length < lastCount * (1 - CLEANUP_DROP_SAFETY)) {
+        warn(`Rewix feed returned ${products.length} products vs ${lastCount} on the last full sync ` +
+             `(a >${CLEANUP_DROP_SAFETY * 100}% drop) — skipping stale-product cleanup this run as a safety ` +
+             `precaution. Investigate the Rewix feed, then re-run with --full once resolved.`);
+        skipCleanup = true;
+      }
+    }
+    fs.writeFileSync(LAST_FULL_COUNT_FILE, String(products.length));
+  }
 
   // Resolve the warehouse location once — passing it to updateVariantInventory
   // avoids re-fetching /locations.json on every variant (was adding ~12-15 min/run).
@@ -652,6 +802,13 @@ async function run() {
         const reactivated = await reactivateIfPriceResolved(existingId, meta?.tags, stillFlagged);
         if (reactivated) log(`  ♻️  Reactivated product ${existingId} — price issue resolved`);
 
+        // Product was previously zeroed/unpublished by cleanupStaleProducts
+        // because it dropped out of the feed — if it's back with real stock,
+        // undo that (republish + drop the rewix-oos tag).
+        const hasStock = payload.dedupedModels.some(m => (m.availability ?? 0) > 0);
+        const backInStock = await reactivateIfBackInStock(existingId, meta?.tags, hasStock);
+        if (backInStock) log(`  ♻️  Republished product ${existingId} — back in stock at Rewix`);
+
         for (let mi = 0; mi < payload.dedupedModels.length; mi++) {
           const m = payload.dedupedModels[mi];
           const v = payload.product.variants[mi];
@@ -689,11 +846,25 @@ async function run() {
     await sleep(SHOPIFY_DELAY);
   }
 
+  // Stale-product cleanup: only on a --full run, and only if the safety
+  // guard above didn't detect a suspicious drop in feed size.
+  let zeroedOut = 0, cleanupFailed = 0;
+  if (forceFullSync && !skipCleanup) {
+    const rewixSkusSeen = new Set();
+    for (const rp of products) {
+      for (const m of rp.models || []) rewixSkusSeen.add(buildSkuFor(m));
+    }
+    const cleanupResult = await cleanupStaleProducts(rewixSkusSeen, { skuData, productMeta }, warehouseLocationId);
+    zeroedOut     = cleanupResult.zeroedOut;
+    cleanupFailed = cleanupResult.failed;
+  }
+
   // Save cursor for next incremental sync (wall-clock anchored, see above)
   fs.writeFileSync(LAST_UPDATE_FILE, syncCursor);
   log(`Saved sync cursor: ${syncCursor}`);
 
-  log(`\n✅  Sync complete — created: ${created}, updated: ${updated}, failed: ${failed}`);
+  log(`\n✅  Sync complete — created: ${created}, updated: ${updated}, failed: ${failed}, ` +
+      `zeroed/unpublished: ${zeroedOut}${cleanupFailed ? `, cleanup failed: ${cleanupFailed}` : ''}`);
 }
 
 run().catch(err => {
