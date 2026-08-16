@@ -254,6 +254,24 @@ function dedupeModelsBySku(models) {
 }
 
 /**
+ * Shopify product_type as "{Gender} {Subcategory}", e.g. "Women Dresses".
+ *
+ * Was previously the bare translated category ("Clothing"), which put ~53% of
+ * the catalog in one undifferentiated bucket and left channel category mappers
+ * (Glami, Allegro, Google) with no type or gender to work from.
+ *
+ * Falls back to the generic category when gender or subcategory is missing, so
+ * a product is never left with an empty type.
+ */
+const PRODUCT_TYPE_GENDER = { Woman: 'Women', Man: 'Men', Junior: 'Junior', Unisex: 'Unisex' };
+
+function buildProductType(gender, subcategory, category) {
+  const g = PRODUCT_TYPE_GENDER[gender];
+  if (!g || !subcategory) return category;
+  return `${g} ${subcategory}`;
+}
+
+/**
  * Build a Shopify product payload from a Rewix product.
  */
 function buildShopifyPayload(rp) {
@@ -360,7 +378,7 @@ function buildShopifyPayload(rp) {
       title,
       body_html:    bodyHtml,
       vendor:       brand,
-      product_type: category,
+      product_type: buildProductType(gender, subcategory, category),
       tags:         allTags,
       status:       (rp.online === false || needsReviewProduct) ? 'draft' : 'active',
       options,
