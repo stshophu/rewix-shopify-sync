@@ -28,6 +28,11 @@ const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
 // Survivor priority: prefer Active over Archived/Draft, then prefer the
 // product with the lowest id (oldest / first created), since that's most
 // likely the original, "real" listing that channels/catalogs are linked to.
+// Canonical SKU key — must stay identical to skuKey() in sync.js.
+function skuKey(sku) {
+  return (sku || '').trim().toLowerCase();
+}
+
 function pickSurvivor(group) {
   const statusRank = { active: 0, draft: 1, archived: 2 };
   return [...group].sort((a, b) => {
@@ -84,7 +89,11 @@ async function run() {
   const groups = new Map(); // representative id -> Set of products
 
   for (const p of products) {
-    const skus = (p.variants || []).map((v) => v.sku).filter(Boolean);
+    // Normalised, for the same reason sync.js normalises: Rewix returns the
+    // same code with inconsistent case, so `BAW00406-metal-panna-U` and
+    // `baw00406-metal-panna-U` are the same product. Grouping on the raw
+    // string left those pairs invisible to this script entirely.
+    const skus = (p.variants || []).map((v) => skuKey(v.sku)).filter(Boolean);
     if (skus.length === 0) continue;
 
     // Find if any SKU already belongs to an existing group

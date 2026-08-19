@@ -1,0 +1,428 @@
+diff -ruN a/delete_duplicates.cjs b/delete_duplicates.cjs
+--- a/delete_duplicates.cjs	2026-08-19 08:05:13.572653601 +0000
++++ b/delete_duplicates.cjs	2026-08-19 08:05:13.595194077 +0000
+@@ -28,6 +28,11 @@
+ // Survivor priority: prefer Active over Archived/Draft, then prefer the
+ // product with the lowest id (oldest / first created), since that's most
+ // likely the original, "real" listing that channels/catalogs are linked to.
++// Canonical SKU key — must stay identical to skuKey() in sync.js.
++function skuKey(sku) {
++  return (sku || '').trim().toLowerCase();
++}
++
+ function pickSurvivor(group) {
+   const statusRank = { active: 0, draft: 1, archived: 2 };
+   return [...group].sort((a, b) => {
+@@ -84,7 +89,11 @@
+   const groups = new Map(); // representative id -> Set of products
+ 
+   for (const p of products) {
+-    const skus = (p.variants || []).map((v) => v.sku).filter(Boolean);
++    // Normalised, for the same reason sync.js normalises: Rewix returns the
++    // same code with inconsistent case, so `BAW00406-metal-panna-U` and
++    // `baw00406-metal-panna-U` are the same product. Grouping on the raw
++    // string left those pairs invisible to this script entirely.
++    const skus = (p.variants || []).map((v) => skuKey(v.sku)).filter(Boolean);
+     if (skus.length === 0) continue;
+ 
+     // Find if any SKU already belongs to an existing group
+diff -ruN a/sync.js b/sync.js
+--- a/sync.js	2026-08-19 08:05:13.573393341 +0000
++++ b/sync.js	2026-08-19 08:05:13.596679615 +0000
+@@ -218,6 +218,25 @@
+ // corrupts inventory: each duplicate's availability gets SET (not added) on
+ // the same Shopify variant, so only whichever one synced last "wins" instead
+ // of the true total being reflected.
++/**
++ * Canonical lookup key for a SKU.
++ *
++ * Rewix has been observed returning the same model's `code` with inconsistent
++ * whitespace AND inconsistent letter case across separate calls ("BAW00406…"
++ * one run, "baw00406…" the next). buildSkuFor() already trims; case was the
++ * remaining gap, and it caused exactly the failure the trim() comment below
++ * describes — the index never matched, sync recreated the product as new, and
++ * cleanupStaleProducts() then treated the ORIGINAL as dropped-from-feed and
++ * zeroed + unpublished it.
++ *
++ * Every Map that is keyed by a SKU must be keyed by skuKey(sku), never by the
++ * raw string. The raw SKU is still what gets written to Shopify — only the
++ * lookup key is normalised.
++ */
++function skuKey(sku) {
++  return (sku || '').trim().toLowerCase();
++}
++
+ function buildSkuFor(m) {
+   const sizeRaw = (m.size != null ? String(m.size) : '').trim();
+   const sizeSlug = sizeRaw.replace(/\s+/g, '-');
+@@ -237,7 +256,7 @@
+ function dedupeModelsBySku(models) {
+   const bySku = new Map();
+   for (const m of models) {
+-    const sku = buildSkuFor(m);
++    const sku = skuKey(buildSkuFor(m));
+     if (!bySku.has(sku)) {
+       bySku.set(sku, { ...m });
+     } else {
+@@ -440,9 +459,12 @@
+   const skuVariantId   = new Map();
+   const modelIdToData  = new Map();
+   const productMeta    = new Map(); // productId -> { tags, status } for manual-hold checks
+-  // sku -> { productId, variantId, inventoryItemId, inventoryQuantity } — used
+-  // by cleanupStaleProducts() to zero out inventory for products that have
+-  // dropped out of a full Rewix feed pull.
++  // variantId -> { sku, key, productId, variantId, inventoryItemId, inventoryQuantity }
++  // Keyed by VARIANT id, not by SKU: two products can still legitimately carry
++  // the same normalised SKU (mid-migration leftovers, case duplicates not yet
++  // cleaned up), and a SKU-keyed map silently dropped one of them — so
++  // cleanupStaleProducts() never zeroed the loser. Keyed by variant id, every
++  // variant is present exactly once.
+   const skuData        = new Map();
+ 
+   let url = `${shopifyBase()}/products.json?limit=250&fields=id,variants,tags,status`;
+@@ -454,9 +476,12 @@
+       productMeta.set(p.id, { tags: p.tags || '', status: p.status });
+       for (const v of p.variants || []) {
+         if (!v.sku) continue;
+-        if (!skuToProductId.has(v.sku)) skuToProductId.set(v.sku, p.id);
+-        skuVariantId.set(v.sku, v.id);
+-        skuData.set(v.sku, {
++        const key = skuKey(v.sku);
++        if (!skuToProductId.has(key)) skuToProductId.set(key, p.id);
++        skuVariantId.set(key, v.id);
++        skuData.set(v.id, {
++          sku:               v.sku,
++          key,
+           productId:         p.id,
+           variantId:         v.id,
+           inventoryItemId:   v.inventory_item_id,
+@@ -581,47 +606,120 @@
+ }
+ 
+ /**
+- * Zeroes inventory + unpublishes every Shopify product tagged 'RewixSync'
+- * whose SKU is absent from a *full* Rewix feed pull. This is the fix for
+- * products that silently drop out of Rewix's export once they hit zero
+- * stock: previously nothing in this script ever noticed they were gone, so
+- * they sat live in Shopify at their last-known quantity forever.
++ * Reconciles Shopify against a *full* Rewix feed pull.
++ *
++ * Two distinct jobs, deliberately kept at the right scope:
++ *
++ *   1. VARIANT scope — any variant whose SKU is absent from the feed has its
++ *      inventory zeroed. A size dropping out of Rewix means that size is gone.
++ *
++ *   2. PRODUCT scope — a product is unpublished and tagged OOS_TAG only when
++ *      EVERY one of its variants is stale. Previously this consequence was
++ *      applied whenever *any* variant went stale, which took whole products
++ *      offline over a single discontinued size while their remaining sizes
++ *      still had real, in-feed stock.
++ *
++ * It also heals the products the old behaviour stranded: a product carrying
++ * OOS_TAG that still has in-feed stock is republished and untagged.
+  *
+  * Caller guarantees this only runs on --full syncs — see run(). manual-hold
+  * products are left completely untouched, same as the normal update path.
++ *
++ * Pass dryRun to log every intended write without performing any of them.
+  */
+-async function cleanupStaleProducts(rewixSkusSeen, { skuData, productMeta }, warehouseLocationId) {
+-  const staleByProduct = new Map(); // productId -> [{sku, variantId, inventoryItemId, inventoryQuantity}]
+-
+-  for (const [sku, data] of skuData.entries()) {
+-    if (rewixSkusSeen.has(sku)) continue;
+-    const tags = productMeta.get(data.productId)?.tags || '';
+-    if (!tags.split(',').map(t => t.trim().toLowerCase()).includes('rewixsync')) continue; // only Rewix-managed products
+-    if (tags.split(',').map(t => t.trim().toLowerCase()).includes('manual-hold')) continue; // respect manual overrides
+-    if (!(data.inventoryQuantity > 0)) continue; // already at 0, nothing to do
+-    if (!staleByProduct.has(data.productId)) staleByProduct.set(data.productId, []);
+-    staleByProduct.get(data.productId).push({ sku, ...data });
++async function cleanupStaleProducts(rewixSkusSeen, { skuData, productMeta }, warehouseLocationId, dryRun = false) {
++  // productId -> { all: [variant…], stale: [variant…] }
++  const byProduct = new Map();
++
++  for (const data of skuData.values()) {
++    const tags = (productMeta.get(data.productId)?.tags || '')
++      .split(',').map(t => t.trim().toLowerCase());
++    if (!tags.includes('rewixsync')) continue;  // only Rewix-managed products
++    if (tags.includes('manual-hold')) continue; // respect manual overrides
++
++    if (!byProduct.has(data.productId)) byProduct.set(data.productId, { all: [], stale: [] });
++    const entry = byProduct.get(data.productId);
++    entry.all.push(data);
++    if (!rewixSkusSeen.has(data.key)) entry.stale.push(data);
++  }
++
++  // Classify before touching anything, so the log lines are meaningful.
++  const toZero    = []; // { productId, variants } — stale variants still holding stock
++  const toRetire  = []; // productId — every variant stale → unpublish + tag
++  const toRestore = []; // productId — tagged OOS but still has in-feed stock
++
++  for (const [productId, { all, stale }] of byProduct.entries()) {
++    const fullyStale = stale.length === all.length;
++    const live       = all.filter(v => !stale.includes(v));
++    const liveStock  = live.reduce((n, v) => n + (v.inventoryQuantity > 0 ? v.inventoryQuantity : 0), 0);
++    const isTaggedOOS = (productMeta.get(productId)?.tags || '')
++      .split(',').map(t => t.trim().toLowerCase()).includes(OOS_TAG);
++
++    const needsZeroing = stale.filter(v => v.inventoryQuantity > 0);
++    if (needsZeroing.length) toZero.push({ productId, variants: needsZeroing });
++
++    if (fullyStale) {
++      if (!isTaggedOOS) toRetire.push(productId);
++    } else if (isTaggedOOS && liveStock > 0) {
++      toRestore.push(productId);
++    }
+   }
+ 
+-  log(`Stale-product cleanup: ${staleByProduct.size} product(s) no longer in Rewix feed`);
+-
+-  let zeroedOut = 0, failed = 0;
+-  for (const [productId, variants] of staleByProduct.entries()) {
+-    try {
+-      for (const v of variants) {
+-        if (v.inventoryItemId && warehouseLocationId) {
+-          await shopifyFetch(`${shopifyBase()}/inventory_levels/set.json`, {
+-            method: 'POST', headers: shopifyHeaders(),
+-            body: JSON.stringify({
+-              inventory_item_id: v.inventoryItemId,
+-              location_id:       warehouseLocationId,
+-              available:         0,
+-            }),
+-          });
++  log(`Stale-variant cleanup: ${toZero.reduce((n, g) => n + g.variants.length, 0)} variant(s) to zero ` +
++      `across ${toZero.length} product(s); ${toRetire.length} product(s) fully out of feed; ` +
++      `${toRestore.length} product(s) to restore (tagged ${OOS_TAG} but still stocked & in feed)`);
++  if (dryRun) log('  ⚠️  DRY RUN — no writes will be performed');
++
++  let zeroedOut = 0, retired = 0, restored = 0, failed = 0;
++
++  // 1. Zero stale variants.
++  for (const { productId, variants } of toZero) {
++    for (const v of variants) {
++      if (!v.inventoryItemId || !warehouseLocationId) {
++        warn(`  Cannot zero ${v.sku} (product ${productId}) — ` +
++             `${!v.inventoryItemId ? 'no inventory_item_id' : 'warehouse location unresolved'}`);
++        failed++;
++        continue;
++      }
++      if (dryRun) {
++        log(`  [dry-run] would zero ${v.sku} (was ${v.inventoryQuantity})`);
++        zeroedOut++;
++        continue;
++      }
++      try {
++        const res = await shopifyFetch(`${shopifyBase()}/inventory_levels/set.json`, {
++          method: 'POST', headers: shopifyHeaders(),
++          body: JSON.stringify({
++            inventory_item_id: v.inventoryItemId,
++            location_id:       warehouseLocationId,
++            available:         0,
++          }),
++        });
++        // Previously unchecked: a failed zeroing still counted as success and
++        // the product was unpublished anyway, so the stock silently survived.
++        if (!res.ok) {
++          const err = await res.json().catch(() => ({}));
++          warn(`  Zeroing failed for ${v.sku}: ${JSON.stringify(err.errors || err)}`);
++          failed++;
++        } else {
++          zeroedOut++;
+         }
++      } catch (err) {
++        warn(`  Zeroing error for ${v.sku}: ${err.message}`);
++        failed++;
+       }
++    }
++  }
+ 
+-      const currentTags = productMeta.get(productId)?.tags || '';
++  // 2. Retire products whose every variant has left the feed.
++  for (const productId of toRetire) {
++    const currentTags = productMeta.get(productId)?.tags || '';
++    if (dryRun) {
++      log(`  [dry-run] would unpublish + tag ${OOS_TAG}: product ${productId}`);
++      retired++;
++      continue;
++    }
++    try {
+       const res = await shopifyFetch(`${shopifyBase()}/products/${productId}.json`, {
+         method: 'PUT', headers: shopifyHeaders(),
+         body: JSON.stringify({
+@@ -633,8 +731,8 @@
+         warn(`Unpublish failed (${productId}): ${JSON.stringify(err.errors || err)}`);
+         failed++;
+       } else {
+-        log(`  🗑 Zeroed + unpublished (not in Rewix feed): product ${productId} [${variants.map(v => v.sku).join(', ')}]`);
+-        zeroedOut++;
++        log(`  🗑 Zeroed + unpublished (entire product out of Rewix feed): ${productId}`);
++        retired++;
+       }
+     } catch (err) {
+       warn(`Cleanup error for product ${productId}: ${err.message}`);
+@@ -642,7 +740,40 @@
+     }
+   }
+ 
+-  return { zeroedOut, failed };
++  // 3. Restore products the old product-scoped rule stranded.
++  for (const productId of toRestore) {
++    const currentTags = productMeta.get(productId)?.tags || '';
++    if (dryRun) {
++      log(`  [dry-run] would republish + untag ${OOS_TAG}: product ${productId}`);
++      restored++;
++      continue;
++    }
++    try {
++      const res = await shopifyFetch(`${shopifyBase()}/products/${productId}.json`, {
++        method: 'PUT', headers: shopifyHeaders(),
++        body: JSON.stringify({
++          product: {
++            id:           productId,
++            published_at: new Date().toISOString(),
++            tags:         removeTag(currentTags, OOS_TAG),
++          },
++        }),
++      });
++      if (!res.ok) {
++        const err = await res.json().catch(() => ({}));
++        warn(`Restore failed (${productId}): ${JSON.stringify(err.errors || err)}`);
++        failed++;
++      } else {
++        log(`  ♻️  Republished (still stocked & in feed): product ${productId}`);
++        restored++;
++      }
++    } catch (err) {
++      warn(`Restore error for product ${productId}: ${err.message}`);
++      failed++;
++    }
++  }
++
++  return { zeroedOut, retired, restored, failed };
+ }
+ 
+ async function updateVariantInventory(variantId, quantity, cost = null, locationId = null) {
+@@ -687,6 +818,9 @@
+ 
+ async function run() {
+   const forceFullSync = process.argv.includes('--full');
++  // Log every intended cleanup write without performing any of it. Use this
++  // before letting a changed cleanup rule loose on the whole catalog.
++  const cleanupDryRun = process.argv.includes('--cleanup-dry-run');
+ 
+   // Validate env vars
+   const required = ['REWIX_BASE_URL','REWIX_API_KEY','REWIX_PASSWORD','SHOPIFY_STORE','SHOPIFY_TOKEN'];
+@@ -761,6 +895,30 @@
+     warn(`Could not resolve warehouse location: ${e.message}`);
+   }
+ 
++  // Stale-product reconciliation runs BEFORE the create/update loop.
++  //
++  // It used to run last, which meant a product the loop had just republished
++  // via reactivateIfBackInStock() was immediately re-tagged and re-unpublished
++  // by cleanup in the same run — every hour, forever. Running it first lets the
++  // loop have the final say on anything that is genuinely back in the feed.
++  //
++  // Only on a --full run, and only if the safety guard above didn't detect a
++  // suspicious drop in feed size.
++  let zeroedOut = 0, retired = 0, restored = 0, cleanupFailed = 0;
++  if (forceFullSync && !skipCleanup) {
++    const rewixSkusSeen = new Set();
++    for (const rp of products) {
++      for (const m of rp.models || []) rewixSkusSeen.add(skuKey(buildSkuFor(m)));
++    }
++    const cleanupResult = await cleanupStaleProducts(
++      rewixSkusSeen, { skuData, productMeta }, warehouseLocationId, cleanupDryRun,
++    );
++    zeroedOut     = cleanupResult.zeroedOut;
++    retired       = cleanupResult.retired;
++    restored      = cleanupResult.restored;
++    cleanupFailed = cleanupResult.failed;
++  }
++
+   let created = 0, updated = 0, skipped = 0, failed = 0;
+ 
+   for (let i = 0; i < products.length; i++) {
+@@ -774,7 +932,7 @@
+     // because the index only stores the full size-suffixed SKU.
+     let existingId = null;
+     for (const m of rp.models || []) {
+-      existingId = skuToProductId.get(buildSkuFor(m));
++      existingId = skuToProductId.get(skuKey(buildSkuFor(m)));
+       if (existingId) break;
+     }
+ 
+@@ -797,10 +955,19 @@
+         if (newProduct) {
+           for (const v of newProduct.variants || []) {
+             if (!v.sku) continue;
+-            skuToProductId.set(v.sku, newProduct.id);
+-            skuVariantId.set(v.sku, v.id);
+-            const bare = v.sku.replace(/-[^-]+$/, '');
+-            if (bare && bare !== v.sku && !skuToProductId.has(bare)) skuToProductId.set(bare, newProduct.id);
++            const key = skuKey(v.sku);
++            skuToProductId.set(key, newProduct.id);
++            skuVariantId.set(key, v.id);
++            skuData.set(v.id, {
++              sku:               v.sku,
++              key,
++              productId:         newProduct.id,
++              variantId:         v.id,
++              inventoryItemId:   v.inventory_item_id,
++              inventoryQuantity: v.inventory_quantity,
++            });
++            const bare = skuKey(v.sku.replace(/-[^-]+$/, ''));
++            if (bare && bare !== key && !skuToProductId.has(bare)) skuToProductId.set(bare, newProduct.id);
+           }
+           // Set wholesale cost + stock on the new variants. Match each created
+           // variant back to its feed model by the size-suffixed SKU. Uses the
+@@ -808,7 +975,8 @@
+           // fire redundant (and order-dependent) inventory writes.
+           for (const m of payload.dedupedModels) {
+             const suffixedSku = buildSkuFor(m);
+-            const vid = skuVariantId.get(suffixedSku) || skuVariantId.get((m.code || '').trim());
++            const vid = skuVariantId.get(skuKey(suffixedSku))
++                     || skuVariantId.get(skuKey(m.code));
+             if (vid) {
+               const costRaw = m.taxable ?? m.bestTaxable;
+               const cost = (costRaw != null && costRaw !== '') ? parseFloat(costRaw) : null;
+@@ -855,8 +1023,8 @@
+           // Reconstruct the same size-suffixed SKU we write on import, then fall
+           // back to bare code (old scheme) and finally the RewixSync model id.
+           const suffixedSku = buildSkuFor(m);
+-          const vid = skuVariantId.get(suffixedSku)
+-                   || skuVariantId.get((m.code || '').trim())
++          const vid = skuVariantId.get(skuKey(suffixedSku))
++                   || skuVariantId.get(skuKey(m.code))
+                    || modelIdToData.get(m.id)?.variantId;
+           if (vid) {
+             await updateVariantPriceOnly(
+@@ -883,25 +1051,14 @@
+     }
+   }
+ 
+-  // Stale-product cleanup: only on a --full run, and only if the safety
+-  // guard above didn't detect a suspicious drop in feed size.
+-  let zeroedOut = 0, cleanupFailed = 0;
+-  if (forceFullSync && !skipCleanup) {
+-    const rewixSkusSeen = new Set();
+-    for (const rp of products) {
+-      for (const m of rp.models || []) rewixSkusSeen.add(buildSkuFor(m));
+-    }
+-    const cleanupResult = await cleanupStaleProducts(rewixSkusSeen, { skuData, productMeta }, warehouseLocationId);
+-    zeroedOut     = cleanupResult.zeroedOut;
+-    cleanupFailed = cleanupResult.failed;
+-  }
+-
+   // Save cursor for next incremental sync (wall-clock anchored, see above)
+   fs.writeFileSync(LAST_UPDATE_FILE, syncCursor);
+   log(`Saved sync cursor: ${syncCursor}`);
+ 
+   log(`\n✅  Sync complete — created: ${created}, updated: ${updated}, failed: ${failed}, ` +
+-      `zeroed/unpublished: ${zeroedOut}${cleanupFailed ? `, cleanup failed: ${cleanupFailed}` : ''}`);
++      `variants zeroed: ${zeroedOut}, products retired: ${retired}, products restored: ${restored}` +
++      `${cleanupFailed ? `, cleanup failed: ${cleanupFailed}` : ''}` +
++      `${cleanupDryRun ? '  (cleanup was a DRY RUN)' : ''}`);
+ }
+ 
+ run().catch(err => {
