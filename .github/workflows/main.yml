@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
+    inputs:
+      cleanup_dry_run:
+        description: 'Dry run: log cleanup changes without making them'
+        type: boolean
+        default: true
 
 concurrency:
   group: rewix-shopify-sync
@@ -48,4 +53,4 @@ jobs:
           REWIX_IMAGE_BASE: ${{ secrets.REWIX_IMAGE_BASE }}
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
-        run: node sync.js --full
+        run: node sync.js --full ${{ inputs.cleanup_dry_run && '--cleanup-dry-run' || '' }}
