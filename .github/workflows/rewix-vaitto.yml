@@ -4,13 +4,37 @@ on:
   schedule:
     - cron: '20 * * * *'
   workflow_dispatch:
+    inputs:
+      full:
+        description: "Force a full resync (ignore the incremental cursor)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: rewix-vaitto-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Bumped from 30: sync.js's bulk Shopify sync of this same catalog takes
+    # 45-50 min on its own, and this script's per-row DB writes were slower
+    # still, so 30 min was killing the job before it ever reached products
+    # later in Rewix's ordering -- exactly where new SKUs tend to land.
+    # Once the incremental cursor below is warm, runs should be much faster
+    # than this ceiling; it's headroom for the (re-)bootstrap full pass.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore sync cursor
+        uses: actions/cache@v4
+        with:
+          path: .rewix_vaitto_last_sync
+          key: rewix-vaitto-cursor-${{ github.run_id }}
+          restore-keys: |
+            rewix-vaitto-cursor-
+
       - run: npm install pg
       - name: Run sync
         env:
@@ -21,4 +45,11 @@ jobs:
           REWIX_REPO_PATH:  '.'
           VAITTO_DB_URL:    ${{ secrets.VAITTO_DB_URL }}
           # VAITTO_DRY_RUN: '1'
-        run: node rewix_sync_vaitto.js
+        run: node rewix_sync_vaitto.js ${{ inputs.full && '--full' || '' }}
+
+      - name: Save sync cursor
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .rewix_vaitto_last_sync
+          key: rewix-vaitto-cursor-${{ github.run_id }}
