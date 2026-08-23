@@ -209,76 +209,87 @@ async function main() {
   const products = data.pageItems || [];
   if (!products.length) { log('Nothing to sync'); if (!DRY_RUN) fs.writeFileSync(LAST_FILE, cursor); await db.end(); return; }
 
-  // TEMP DEBUG — remove after checking tag names
-  console.log('─── DEBUG: raw tags for first product ───');
-  console.log(JSON.stringify(products[0].tags, null, 2));
-  console.log('──────────────────────────────────────────');
-
   const existing           = await loadExisting(db);
   const { map: brandMap, unknownId } = await loadBrands(db);
   log(`  ${existing.size} existing · ${brandMap.size} brands`);
 
   const counts = { created:0, updated:0, deactivated:0, skipped:0, errors:0 };
 
-  for (let i = 0; i < products.length; i++) {
-    const rp = products[i];
-    let parsed;
-    try { parsed = parseProduct(rp, brandMap, unknownId); }
-    catch(e) { warn(`Parse error ${rp.id}: ${e.message}`); counts.errors++; continue; }
+  // One transaction for the whole batch instead of an autocommit round-trip
+  // (+ a 50ms artificial sleep) per product. For a catalog this size that
+  // per-row overhead was the main reason runs blew past the 30-minute
+  // job timeout before ever reaching products later in Rewix's ordering --
+  // which is exactly where genuinely new SKUs tend to land. A single
+  // transaction also means a mid-run failure can't leave the sync half
+  // applied: either the whole batch commits or none of it does.
+  if (!DRY_RUN) await db.query('BEGIN');
 
-    const { productSku, title, desc, categoryId, subcategoryId, gender,
-            brandId, cost, rrp, stockQty, images } = parsed;
-    const isNew = !existing.has(productSku);
-    log(`[${i+1}/${products.length}]  ${productSku}  '${title}'  stock=${stockQty}`);
+  try {
+    for (let i = 0; i < products.length; i++) {
+      const rp = products[i];
+      let parsed;
+      try { parsed = parseProduct(rp, brandMap, unknownId); }
+      catch(e) { warn(`Parse error ${rp.id}: ${e.message}`); counts.errors++; continue; }
 
-    if (isNew && stockQty === 0) { counts.skipped++; continue; }
-
-    if (!isNew && stockQty === 0) {
-      if (!DRY_RUN) {
-        await db.query("UPDATE products SET active = false, stock_qty = 0 WHERE id = $1", [existing.get(productSku)]);
+      const { productSku, title, desc, categoryId, subcategoryId, gender,
+              brandId, cost, rrp, stockQty, images } = parsed;
+      const isNew = !existing.has(productSku);
+      if ((i + 1) % 200 === 0 || i === products.length - 1) {
+        log(`[${i+1}/${products.length}]  ${productSku}  '${title}'  stock=${stockQty}`);
       }
-      log(`  🔴 DEACTIVATED`); counts.deactivated++; continue;
+
+      if (isNew && stockQty === 0) { counts.skipped++; continue; }
+
+      if (!isNew && stockQty === 0) {
+        if (!DRY_RUN) {
+          await db.query("UPDATE products SET active = false, stock_qty = 0 WHERE id = $1", [existing.get(productSku)]);
+        }
+        counts.deactivated++; continue;
+      }
+
+      const slug = `${SUPPLIER_ID.slice(0,8)}-${productSku}`.toLowerCase().replace(/\s+/g,'-').slice(0,200);
+      const imagesJson = JSON.stringify(images.slice(0,10).map(u=>({url:u})));
+
+      if (DRY_RUN) { continue; }
+
+      try {
+        if (isNew) {
+          const res = await db.query(`
+            INSERT INTO products (
+              supplier_id, vaitto_sku, name, slug, brand_id,
+              category_id, subcategory_id, gender, description,
+              supplier_price, rrp, stock_qty, active, dropship_available,
+              image_url, images
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true,true,$13,$14)
+            RETURNING id`,
+            [SUPPLIER_ID, productSku, title, slug, brandId,
+             categoryId, subcategoryId, gender, desc||'',
+             cost, rrp, stockQty,
+             images[0]||null, imagesJson]
+          );
+          existing.set(productSku, res.rows[0].id);
+          counts.created++;
+        } else {
+          await db.query(`
+            UPDATE products SET
+              name=$1, brand_id=$2, category_id=$3, subcategory_id=$4,
+              gender=$5, description=$6, supplier_price=$7, rrp=$8,
+              stock_qty=$9, active=true, image_url=$10, images=$11
+            WHERE id=$12`,
+            [title, brandId, categoryId, subcategoryId,
+             gender, desc||'', cost, rrp,
+             stockQty, images[0]||null, imagesJson,
+             existing.get(productSku)]
+          );
+          counts.updated++;
+        }
+      } catch(e) { warn(`DB error ${productSku}: ${e.message}`); counts.errors++; }
     }
 
-    const slug = `${SUPPLIER_ID.slice(0,8)}-${productSku}`.toLowerCase().replace(/\s+/g,'-').slice(0,200);
-    const imagesJson = JSON.stringify(images.slice(0,10).map(u=>({url:u})));
-
-    if (DRY_RUN) { log(`  [DRY RUN] ${isNew?'CREATE':'UPDATE'}`); continue; }
-
-    try {
-      if (isNew) {
-        const res = await db.query(`
-          INSERT INTO products (
-            supplier_id, vaitto_sku, name, slug, brand_id,
-            category_id, subcategory_id, gender, description,
-            supplier_price, rrp, stock_qty, active, dropship_available,
-            image_url, images
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true,true,$13,$14)
-          RETURNING id`,
-          [SUPPLIER_ID, productSku, title, slug, brandId,
-           categoryId, subcategoryId, gender, desc||'',
-           cost, rrp, stockQty,
-           images[0]||null, imagesJson]
-        );
-        existing.set(productSku, res.rows[0].id);
-        log(`  ✅ CREATED`); counts.created++;
-      } else {
-        await db.query(`
-          UPDATE products SET
-            name=$1, brand_id=$2, category_id=$3, subcategory_id=$4,
-            gender=$5, description=$6, supplier_price=$7, rrp=$8,
-            stock_qty=$9, active=true, image_url=$10, images=$11
-          WHERE id=$12`,
-          [title, brandId, categoryId, subcategoryId,
-           gender, desc||'', cost, rrp,
-           stockQty, images[0]||null, imagesJson,
-           existing.get(productSku)]
-        );
-        log(`  🔄 UPDATED`); counts.updated++;
-      }
-    } catch(e) { warn(`DB error ${productSku}: ${e.message}`); counts.errors++; }
-
-    await sleep(50);
+    if (!DRY_RUN) await db.query('COMMIT');
+  } catch (e) {
+    if (!DRY_RUN) await db.query('ROLLBACK');
+    throw e;
   }
 
   await db.end();
