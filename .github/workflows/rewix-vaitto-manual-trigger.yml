@@ -1,0 +1,53 @@
+name: Rewix → Vaitto (manual trigger, live app)
+
+# Manual-only on purpose. pg_cron already triggers the real
+# rewix-vaitto-sync route hourly from inside Supabase — this workflow does
+# NOT duplicate that schedule. It exists purely so you have a "Run workflow"
+# button you can press on demand, with logs you can actually read, without
+# needing Supabase access or a raw curl command each time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Force a full resync (ignore the incremental cursor)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: rewix-vaitto-manual-trigger
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call the live Rewix sync route
+        env:
+          HOOK_SECRET: ${{ secrets.IMPORT_HOOK_SECRET }}
+          FULL_FLAG:   ${{ inputs.full }}
+        run: |
+          set -e
+          URL="https://vaitto.com/api/public/hooks/rewix-vaitto-sync"
+          BODY="{}"
+          if [ "$FULL_FLAG" = "true" ]; then BODY='{"full": true}'; fi
+
+          echo "POST $URL  (full=$FULL_FLAG)"
+
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST "$URL" \
+            -H "x-hook-secret: $HOOK_SECRET" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          echo "─── Response ($HTTP_CODE) ───"
+          cat response.json | jq . 2>/dev/null || cat response.json
+          echo "──────────────────────────────"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "❌ Sync route returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ Sync triggered successfully"
