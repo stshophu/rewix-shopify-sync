@@ -357,7 +357,12 @@ function buildShopifyPayload(rp) {
       option1:              m.modelLocalizations?.color?.['en_US']?.value || m.color || 'Default',
       option2:              m.modelLocalizations?.size?.['en_US']?.value  || m.size  || undefined,
       inventory_management: 'shopify',
-      inventory_quantity:   m.availability ?? 0,
+      // NO inventory_quantity here. The REST product-create call writes that
+      // quantity to the shop's PRIMARY location (Hanau Warehouse), not to
+      // 3169 — and nothing ever updated it again, leaving phantom stock that
+      // channels could sell after Rewix had sold out. Stock is set on 3169
+      // right after create by updateVariantInventory(), and
+      // enforceWarehouseOnly() then removes every other location.
       weight:               rp.weight ? parseFloat(rp.weight) : undefined,
       weight_unit:          rp.weight ? 'kg' : undefined,
       fulfillment_service:  'manual',
@@ -796,7 +801,7 @@ async function updateVariantInventory(variantId, quantity, cost = null, location
   if (!locationId) {
     const locRes = await shopifyFetch(`${shopifyBase()}/locations.json`, { headers: shopifyHeaders() });
     const { locations } = await locRes.json();
-    const location = locations?.find(l => l.name === '3169 Warehouse') || locations?.[0];
+    const location = locations?.find(l => l.name === '3169 Warehouse');
     locationId = location?.id;
   }
   if (!locationId) {
@@ -812,6 +817,79 @@ async function updateVariantInventory(variantId, quantity, cost = null, location
       available:         quantity,
     }),
   });
+}
+
+const REWIX_TAG_RE = /(^|,)\s*rewixsync\s*(,|$)/i;
+
+/**
+ * Rewix products belong to "3169 Warehouse" ONLY. Shopify auto-links every new
+ * product to the shop's primary location (Hanau Warehouse), and any stock left
+ * there is never updated by this sync — so channels kept selling items Rewix
+ * had already sold out. This removes every non-3169 inventory level from the
+ * given inventory items (deleting the level also deletes its quantity).
+ *
+ * Safe-guards:
+ *  - an item with no level at 3169 is skipped (removing its only location
+ *    would fail, and we don't want it to vanish from inventory);
+ *  - a level with committed/incoming stock is left alone and reported;
+ *  - dryRun logs what would be removed without changing anything.
+ */
+async function enforceWarehouseOnly(inventoryItemIds, warehouseLocationId, dryRun = false) {
+  const stats = { checked: 0, removed: 0, skipped: 0, failed: 0 };
+  if (!warehouseLocationId) {
+    warn('enforceWarehouseOnly: 3169 Warehouse not resolved — skipping location cleanup');
+    return stats;
+  }
+  const ids = [...new Set(inventoryItemIds.filter(Boolean))];
+  for (let i = 0; i < ids.length; i += 50) {
+    const chunk = ids.slice(i, i + 50);
+    // Collect every level for this chunk (paginated).
+    const levels = [];
+    let url = `${shopifyBase()}/inventory_levels.json?limit=250&inventory_item_ids=${chunk.join(',')}`;
+    while (url) {
+      const res = await shopifyFetch(url, { headers: shopifyHeaders() });
+      if (!res.ok) { warn(`inventory_levels fetch failed: ${res.status}`); stats.failed += chunk.length; break; }
+      const data = await res.json();
+      levels.push(...(data.inventory_levels || []));
+      const link = res.headers.get('Link') || '';
+      url = link.match(/<([^>]+)>;\s*rel="next"/)?.[1] || null;
+    }
+    const byItem = new Map();
+    for (const l of levels) {
+      if (!byItem.has(l.inventory_item_id)) byItem.set(l.inventory_item_id, []);
+      byItem.get(l.inventory_item_id).push(l);
+    }
+    for (const [itemId, itemLevels] of byItem) {
+      stats.checked++;
+      const hasWarehouse = itemLevels.some(l => String(l.location_id) === String(warehouseLocationId));
+      const others = itemLevels.filter(l => String(l.location_id) !== String(warehouseLocationId));
+      if (!others.length) continue;
+      if (!hasWarehouse) {
+        warn(`  item ${itemId} is not stocked at 3169 — leaving its other location(s) in place`);
+        stats.skipped++;
+        continue;
+      }
+      for (const l of others) {
+        if (dryRun) {
+          log(`  [dry-run] would remove location ${l.location_id} from item ${itemId} (available ${l.available})`);
+          stats.removed++;
+          continue;
+        }
+        const res = await shopifyFetch(
+          `${shopifyBase()}/inventory_levels.json?inventory_item_id=${itemId}&location_id=${l.location_id}`,
+          { method: 'DELETE', headers: shopifyHeaders() },
+        );
+        if (res.ok) {
+          stats.removed++;
+        } else {
+          const err = await res.json().catch(() => ({}));
+          warn(`  could not remove location ${l.location_id} from item ${itemId}: ${JSON.stringify(err.errors || err)}`);
+          stats.failed++;
+        }
+      }
+    }
+  }
+  return stats;
 }
 
 // ─── MAIN ──────────────────────────────────────────────────────────────────────
@@ -887,7 +965,7 @@ async function run() {
   try {
     const locRes = await shopifyFetch(`${shopifyBase()}/locations.json`, { headers: shopifyHeaders() });
     const { locations } = await locRes.json();
-    const loc = locations?.find(l => l.name === '3169 Warehouse') || locations?.[0];
+    const loc = locations?.find(l => l.name === '3169 Warehouse');
     warehouseLocationId = loc?.id || null;
     if (warehouseLocationId) log(`Warehouse location resolved: ${loc.name} (${warehouseLocationId})`);
     else warn('Location "3169 Warehouse" not found — inventory updates will be skipped');
@@ -983,6 +1061,11 @@ async function run() {
               await updateVariantInventory(vid, m.availability ?? 0, cost, warehouseLocationId);
             }
           }
+          // Shopify linked the new variants to the primary location (Hanau) on
+          // create — remove it so 3169 is the only place this stock lives.
+          const newItemIds = (newProduct.variants || []).map(v => v.inventory_item_id);
+          const loc = await enforceWarehouseOnly(newItemIds, warehouseLocationId, false);
+          if (loc.removed) log(`  📍 ${loc.removed} non-3169 location link(s) removed from new product ${newProduct.id}`);
           created++;
         } else {
           failed++;
@@ -1050,6 +1133,19 @@ async function run() {
       log(`Progress: ${i + 1}/${products.length} | ✅ created:${created} updated:${updated} skipped:${skipped} ❌ failed:${failed}`);
     }
   }
+
+  // Location sweep: every RewixSync variant must live at 3169 only. On the
+  // first run this removes the Hanau links (and their phantom stock) from the
+  // whole existing Rewix catalog; afterwards it only catches stragglers, e.g.
+  // a product someone created or edited by hand. Respects --cleanup-dry-run.
+  const rewixItemIds = [];
+  for (const d of skuData.values()) {
+    if (REWIX_TAG_RE.test(productMeta.get(d.productId)?.tags || '')) rewixItemIds.push(d.inventoryItemId);
+  }
+  log(`Location sweep: checking ${rewixItemIds.length} RewixSync inventory items for non-3169 locations…`);
+  const sweep = await enforceWarehouseOnly(rewixItemIds, warehouseLocationId, cleanupDryRun);
+  log(`Location sweep done — items checked: ${sweep.checked}, links removed: ${sweep.removed}, ` +
+      `skipped (not at 3169): ${sweep.skipped}, failed: ${sweep.failed}${cleanupDryRun ? '  (DRY RUN)' : ''}`);
 
   // Save cursor for next incremental sync (wall-clock anchored, see above)
   fs.writeFileSync(LAST_UPDATE_FILE, syncCursor);
