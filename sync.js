@@ -875,6 +875,20 @@ async function enforceWarehouseOnly(inventoryItemIds, warehouseLocationId, dryRu
           stats.removed++;
           continue;
         }
+        // Zero the level first. Deleting a level that still holds stock leaves
+        // that number behind on the inactive location (visible in the admin
+        // and in exports as on-hand at Hanau), so set it to 0 before removing.
+        if (l.available) {
+          const z = await shopifyFetch(`${shopifyBase()}/inventory_levels/set.json`, {
+            method: 'POST', headers: shopifyHeaders(),
+            body: JSON.stringify({ inventory_item_id: itemId, location_id: l.location_id, available: 0 }),
+          });
+          if (!z.ok) {
+            warn(`  could not zero location ${l.location_id} on item ${itemId} — leaving it in place`);
+            stats.failed++;
+            continue;
+          }
+        }
         const res = await shopifyFetch(
           `${shopifyBase()}/inventory_levels.json?inventory_item_id=${itemId}&location_id=${l.location_id}`,
           { method: 'DELETE', headers: shopifyHeaders() },

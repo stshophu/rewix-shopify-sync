@@ -1,0 +1,36 @@
+name: Reset Hanau Leftovers (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Type 'apply' to actually reset. Leave blank for a dry run."
+        required: false
+        default: ''
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - name: Run reset
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.apply }}" = "apply" ]; then
+            node reset_hanau_leftovers.cjs hanau_reset_skus.txt --apply
+          else
+            node reset_hanau_leftovers.cjs hanau_reset_skus.txt
+          fi
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hanau-reset-report
+          path: hanau_reset_report.csv
