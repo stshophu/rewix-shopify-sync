@@ -25,6 +25,8 @@ const PREFIXES = [
 
 const FABRIC_TAG = 'fabric-brand';
 const NO_GOOGLE_TAG = 'no-google';
+// Google & YouTube app custom label 0 -> exclude in Merchant Center with a rule on custom_label_0 = no-google
+const GOOGLE_LABEL_MF = { namespace: 'mm-google-shopping', key: 'custom_label_0', value: 'no-google', type: 'single_line_text_field' };
 
 /** Mill name if `vendor` (or a tag/title hint) marks a fabric-brand product, else null. */
 function fabricMill(vendor, { title = '', tags = [] } = {}) {
@@ -59,4 +61,4 @@ function fabricBody(bodyHtml, mill) {
   return fabricNoteHtml(mill) + body;
 }
 
-module.exports = { fabricMill, fabricTitle, fabricBody, FABRIC_TAG, NO_GOOGLE_TAG };
+module.exports = { fabricMill, fabricTitle, fabricBody, FABRIC_TAG, NO_GOOGLE_TAG, GOOGLE_LABEL_MF };
