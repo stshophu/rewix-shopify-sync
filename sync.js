@@ -28,6 +28,7 @@ const fs   = require('fs');
 const path = require('path');
 const { buildTitle, translateCategory, translateSubcategory,
         normalizeMadeIn, normalizeSeason, normalizeGender } = require('./translate.cjs');
+const { fabricMill, fabricTitle, fabricBody, FABRIC_TAG, NO_GOOGLE_TAG } = require('./fabric-brand.cjs');
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
 
@@ -332,11 +333,17 @@ function buildShopifyPayload(rp) {
   // this is the fix_titles.cjs logic, applied at import time so products
   // are born correct instead of needing a backfill. Uses the English
   // subcategory so the garment-noun fallback inside buildTitle is English too.
-  const title = buildTitle({ brand, gender, name: rp.name, color, subcat: subcategory })
+  const builtTitle = buildTitle({ brand, gender, name: rp.name, color, subcat: subcategory })
              || localized(rp.productLocalizations, 'productName')
              || rp.name;
 
-  const bodyHtml = localized(rp.productLocalizations, 'description') || '';
+  // "Loro Piana Fabric" & co. are other makers' garments in a mill's cloth —
+  // never sell them under the mill's name (Google misrepresentation). See fabric-brand.cjs.
+  const mill = fabricMill(brand, { title: builtTitle });
+  const title = mill ? fabricTitle(builtTitle, mill) : builtTitle;
+
+  const rawBody  = localized(rp.productLocalizations, 'description') || '';
+  const bodyHtml = mill ? fabricBody(rawBody, mill) : rawBody;
 
   // ── Images ────────────────────────────────────────────────────
   const images = (rp.images || []).map(img => ({
@@ -392,6 +399,7 @@ function buildShopifyPayload(rp) {
   const baseTags  = [brand, category, gender, season, 'RewixSync'].filter(Boolean);
   if (hasNoCost)       baseTags.push('needs-price-review'); // feed gave us no cost to work from
   if (hasUnprofitable) baseTags.push('rewix-unprofitable');  // priced, but can't clear margin even at RRP
+  if (mill)            baseTags.push(FABRIC_TAG, NO_GOOGLE_TAG);
   const allTags   = [...new Set(baseTags)].join(', ');
 
   // ── Metafields ────────────────────────────────────────────────
@@ -415,7 +423,7 @@ function buildShopifyPayload(rp) {
     product: {
       title,
       body_html:    bodyHtml,
-      vendor:       brand,
+      vendor:       mill ? `${mill} Fabric` : brand,
       product_type: buildProductType(gender, subcategory, category),
       tags:         allTags,
       status:       (rp.online === false || needsReviewProduct) ? 'draft' : 'active',

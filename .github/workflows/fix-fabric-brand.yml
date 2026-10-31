@@ -1,0 +1,24 @@
+name: Fix "Loro Piana Fabric" product titles (manual, one-off)
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Actually update products? (false = dry run)"
+        type: boolean
+        default: false
+concurrency:
+  group: rewix-shopify-sync
+  cancel-in-progress: false
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Rename fabric-brand products
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+        run: node fix_fabric_brand.cjs ${{ inputs.apply && '--apply' || '' }}
