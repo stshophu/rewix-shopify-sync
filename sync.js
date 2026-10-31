@@ -28,7 +28,7 @@ const fs   = require('fs');
 const path = require('path');
 const { buildTitle, translateCategory, translateSubcategory,
         normalizeMadeIn, normalizeSeason, normalizeGender } = require('./translate.cjs');
-const { fabricMill, fabricTitle, fabricBody, FABRIC_TAG, NO_GOOGLE_TAG } = require('./fabric-brand.cjs');
+const { fabricMill, fabricTitle, fabricBody, FABRIC_TAG, NO_GOOGLE_TAG, GOOGLE_LABEL_MF } = require('./fabric-brand.cjs');
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
 
@@ -414,6 +414,7 @@ function buildShopifyPayload(rp) {
     gender      && { namespace: 'rewix', key: 'gender',      value: gender,                       type: 'single_line_text_field' },
     season      && { namespace: 'rewix', key: 'season',      value: season,                       type: 'single_line_text_field' },
     composition && { namespace: 'rewix', key: 'composition', value: composition,                  type: 'single_line_text_field' },
+    mill        && GOOGLE_LABEL_MF,
   ].filter(Boolean);
 
   return {

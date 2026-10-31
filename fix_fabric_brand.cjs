@@ -6,12 +6,13 @@
  *   - vendor      "<Mill> Fabric"
  *   - SEO title   same as the new title
  *   - tags        + fabric-brand, no-google
+ *   - Google & YouTube custom label 0 = no-google (metafield mm-google-shopping.custom_label_0)
  * Covers all suppliers (Rewix, LH8, ...). Genuine Loro Piana products are left alone.
  *
  *   node fix_fabric_brand.cjs           # dry run — lists what would change
  *   node fix_fabric_brand.cjs --apply   # applies
  */
-const { fabricMill, fabricTitle, fabricBody, FABRIC_TAG, NO_GOOGLE_TAG } = require('./fabric-brand.cjs');
+const { fabricMill, fabricTitle, fabricBody, FABRIC_TAG, NO_GOOGLE_TAG, GOOGLE_LABEL_MF } = require('./fabric-brand.cjs');
 
 const STORE = process.env.SHOPIFY_STORE;
 const TOKEN = process.env.SHOPIFY_TOKEN;
@@ -44,7 +45,8 @@ async function gql(query, variables = {}) {
 const SCAN = `query($after: String, $q: String) {
   products(first: 100, after: $after, query: $q) {
     pageInfo { hasNextPage endCursor }
-    nodes { id title vendor tags descriptionHtml status }
+    nodes { id title vendor tags descriptionHtml status
+            label: metafield(namespace: "mm-google-shopping", key: "custom_label_0") { value } }
   }
 }`;
 
@@ -67,7 +69,7 @@ const UPDATE = `mutation($input: ProductInput!) {
       const vendor = `${mill} Fabric`;
       const tags = [...new Set([...p.tags, FABRIC_TAG, NO_GOOGLE_TAG])];
       if (title === p.title && body === p.descriptionHtml && vendor === p.vendor &&
-          tags.length === p.tags.length) continue;
+          tags.length === p.tags.length && p.label?.value === GOOGLE_LABEL_MF.value) continue;
       todo.push({ p, title, body, vendor, tags });
     }
     after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
@@ -82,6 +84,7 @@ const UPDATE = `mutation($input: ProductInput!) {
     const r = (await gql(UPDATE, { input: {
       id: t.p.id, title: t.title, descriptionHtml: t.body, vendor: t.vendor,
       tags: t.tags, seo: { title: t.title },
+      metafields: [GOOGLE_LABEL_MF],
     } })).productUpdate;
     if (r.userErrors.length) { errors++; console.log('ERROR', t.p.title, JSON.stringify(r.userErrors)); }
     if ((i + 1) % 50 === 0) console.log(`  ${i + 1}/${todo.length} done`);
