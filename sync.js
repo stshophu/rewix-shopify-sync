@@ -53,6 +53,20 @@ const SHOPIFY_API_VERSION  = '2024-01';
 // this run (everything else — create/update — still proceeds normally).
 const CLEANUP_DROP_SAFETY = 0.5;
 
+// Only real, publicly usable GTINs (EAN-8, UPC-A, EAN-13/JAN, GTIN-14) go to
+// Shopify. Supplier-internal codes, wrong check digits and GS1 "restricted
+// circulation" ranges get flagged by Google Merchant Center as false identifiers.
+function validGtin(code) {
+  const g = String(code ?? '').trim();
+  if (!/^\d+$/.test(g) || ![8, 12, 13, 14].includes(g.length) || new Set(g).size === 1) return false;
+  const d = g.split('').map(Number).reverse();
+  const total = d.slice(1).reduce((sum, x, i) => sum + x * (i % 2 === 0 ? 3 : 1), 0);
+  if ((10 - (total % 10)) % 10 !== d[0]) return false;
+  const g13 = g.length < 13 ? g.padStart(13, '0') : g.slice(-13);
+  if (g13[0] === '2' || g13.startsWith('02') || g13.startsWith('04')) return false;
+  return true;
+}
+
 // ─── HELPERS ───────────────────────────────────────────────────────────────────
 
 const log  = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -263,7 +277,7 @@ function dedupeModelsBySku(models) {
       const kept = bySku.get(sku);
       kept.availability = (kept.availability ?? 0) + (m.availability ?? 0);
       // Backfill anything the first-seen duplicate happened to be missing.
-      if (!kept.barcode && m.barcode) kept.barcode = m.barcode;
+      if (!kept.barcode && validGtin(m.barcode)) kept.barcode = m.barcode;
       if ((kept.taxable == null || kept.taxable === '') && m.taxable != null) kept.taxable = m.taxable;
       if ((kept.bestTaxable == null || kept.bestTaxable === '') && m.bestTaxable != null) kept.bestTaxable = m.bestTaxable;
       if ((kept.streetPrice == null || kept.streetPrice === '') && m.streetPrice != null) kept.streetPrice = m.streetPrice;
@@ -353,7 +367,7 @@ function buildShopifyPayload(rp) {
       sku:                  sku || undefined,
       price:                price.toFixed(2),
       compare_at_price:     compareAt ? compareAt.toFixed(2) : undefined,
-      barcode:              m.barcode || undefined,
+      barcode:              validGtin(m.barcode) ? String(m.barcode).trim() : undefined,
       option1:              m.modelLocalizations?.color?.['en_US']?.value || m.color || 'Default',
       option2:              m.modelLocalizations?.size?.['en_US']?.value  || m.size  || undefined,
       inventory_management: 'shopify',
