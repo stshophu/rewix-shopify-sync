@@ -153,23 +153,12 @@ function tagValueEN(tags, tagName) {
   return tag?.value?.localeValues?.en_US?.value || tagValue(tags, tagName) || '';
 }
 
-// ─── PRICING (25% margin, rewix_repricer.py formula) ───────────────────────
-// price = (cost + shipping) * VAT / (1 - margin), rounded to .99, capped at
-// the feed's streetPrice (RRP). Cost comes straight from the Rewix feed
-// (m.taxable / m.bestTaxable) — present on 100% of models per the feed
-// diagnostic — so pricing no longer depends on Shopify inventory_item.cost
-// ever having been populated.
-const PRICING_SHIPPING = 15.0;
-const PRICING_VAT      = 1.19;
-const PRICING_MARGIN   = 0.25;
-const PRICING_DIVISOR  = 1 - PRICING_MARGIN; // 0.75
-
-function roundTo99(price) {
-  if (price <= 0) return 0;
-  const floor = Math.floor(price);
-  const candidate = floor + 0.99;
-  return Math.abs(price - candidate) < 1e-9 ? price : candidate;
-}
+// ─── PRICING (RRP-based brand tiers, see pricing.cjs) ───────────────────────
+// Since 12 Nov 2026: price = RRP × brand-tier share (strong 70 %, default
+// 60 %, slower 55 %), floored at a minimum € profit and the old 25 %-margin
+// price, capped at 90 % of RRP. Cost comes straight from the Rewix feed
+// (m.taxable / m.bestTaxable), RRP from m.streetPrice.
+const { priceRewix } = require('./pricing.cjs');
 
 /**
  * Computes the resale price for one Rewix model.
@@ -179,35 +168,14 @@ function roundTo99(price) {
  *   'unprofitable'   — even at full RRP, the formula can't clear the target margin
  * Callers must draft the product and tag it accordingly rather than publish a guess.
  */
-function computeVariantPricing(m) {
+function computeVariantPricing(m, { brand = '', isFabric = false } = {}) {
   const costRaw  = m.taxable ?? m.bestTaxable;
   const cost     = (costRaw !== undefined && costRaw !== null && costRaw !== '') ? parseFloat(costRaw) : NaN;
-  const hasCost  = Number.isFinite(cost) && cost > 0;
 
   const streetRaw   = m.streetPrice;
   const streetPrice = (streetRaw !== undefined && streetRaw !== null && streetRaw !== '') ? parseFloat(streetRaw) : null;
 
-  let price = null;
-  let reviewReason = null;
-
-  if (hasCost) {
-    const minViable = (cost + PRICING_SHIPPING) * PRICING_VAT / PRICING_DIVISOR;
-    let computed = roundTo99(minViable);
-    if (streetPrice && streetPrice > 0 && computed > streetPrice) {
-      computed = streetPrice; // never price above RRP
-    }
-    if (computed > 0) {
-      price = computed;
-      // Even capped at RRP, this must still clear (near enough) the target
-      // margin — matches rewix_repricer.py's profitability check. A product
-      // capped well below min_viable would otherwise sell silently at a loss.
-      if (computed < minViable - 0.01) reviewReason = 'unprofitable';
-    } else {
-      reviewReason = 'unprofitable';
-    }
-  } else {
-    reviewReason = 'no-cost'; // no real cost in the feed for this model
-  }
+  let { price, reviewReason } = priceRewix({ cost, rrp: streetPrice, brand, isFabric });
 
   // Shopify still needs a non-negative price even on a flagged product, so the
   // payload doesn't fail to create/update. Best-effort fallback only — the
@@ -351,7 +319,7 @@ function buildShopifyPayload(rp) {
   }));
 
   // ── Variants & pricing ───────────────────────────────────────────
-  // 25%-margin formula sourced straight from the feed's own cost
+  // RRP-based brand-tier pricing (pricing.cjs), cost straight from the feed
   // (m.taxable / m.bestTaxable). Any model we can't safely/profitably price
   // sets a review flag, which drafts the whole product below.
   let hasNoCost     = false;
@@ -360,7 +328,7 @@ function buildShopifyPayload(rp) {
   const dedupedModels = dedupeModelsBySku(rp.models || []);
 
   const variants = dedupedModels.map(m => {
-    const { price, compareAt, reviewReason } = computeVariantPricing(m);
+    const { price, compareAt, reviewReason } = computeVariantPricing(m, { brand, isFabric: !!mill });
     if (reviewReason === 'no-cost') hasNoCost = true;
     if (reviewReason === 'unprofitable') hasUnprofitable = true;
 

@@ -15,6 +15,9 @@ Requires: pip3 install requests
 """
 
 import sys
+
+sys.exit("RETIRED 12 Nov 2026: Rewix prices now come from pricing.cjs (RRP-based brand tiers) via sync.js. "
+         "Running this old 25%-margin repricer would undo that.")
 import os
 import time
 import requests

@@ -1,3 +1,18 @@
+# CHANGES — 2026-11-12
+
+## RRP-based pricing (pricing.cjs)
+
+Rewix prices are no longer flat cost-plus. `sync.js` now prices every variant via
+`pricing.cjs`:
+- target = RRP × brand share: strong brands 70 % (≈30 % off), default 60 %
+  (≈40 % off), slower brands 55 % (≈45 % off) — brand lists at the top of pricing.cjs
+- floor: at least €35 profit per item after cost, €15 shipping and VAT, and never
+  below the old 25 %-margin price
+- cap: max 90 % of RRP (old 25 %-margin floor still wins, up to full RRP)
+- "… Fabric" (mill) products always use the default tier
+`rewix_repricer.py` is retired. Preview impact any time with the manual
+"Preview Rewix pricing" workflow (read-only, CSV artifact).
+
 # CHANGES — 2026-06-18
 
 This update fixes pricing, titles, categories, and variant SKUs in the
