@@ -1,0 +1,23 @@
+name: Preview Rewix pricing (manual, read-only)
+on:
+  workflow_dispatch:
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Compare current vs new prices
+        env:
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+        run: node preview_pricing.cjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pricing-preview
+          path: |
+            pricing_preview.csv
+            pricing_preview_brands.csv
