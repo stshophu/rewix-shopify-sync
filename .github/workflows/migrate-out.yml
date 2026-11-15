@@ -1,0 +1,74 @@
+name: One-off — hand this repo's jobs over to viterbo-runner
+
+# Started by the "Migrate repos into this runner" workflow in
+# stshophu/viterbo-runner, which also creates and afterwards deletes the
+# MIGRATE_TOKEN secret here. Copies this repo's secrets and variables to the
+# runner (with a prefix), optionally removes the schedules here and switches
+# on the runner copies. Secret values are never printed.
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: "Prefix for the copied secrets (e.g. PF)"
+        required: true
+      remove_schedules:
+        type: boolean
+        default: true
+      enable:
+        description: "Switch on the runner copies (sets <prefix>_ENABLED=true)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  move:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.MIGRATE_TOKEN }}
+      PREFIX: ${{ inputs.prefix }}
+      RUNNER: stshophu/viterbo-runner
+    steps:
+      - name: Copy secrets and variables to the runner
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+          ALL_VARS: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          n=0
+          for k in $(jq -r 'keys[]' <<<"$ALL_SECRETS"); do
+            case "$k" in github_token|MIGRATE_TOKEN) continue ;; esac
+            jq -j --arg k "$k" '.[$k]' <<<"$ALL_SECRETS" | gh secret set "${PREFIX}_$k" --repo "$RUNNER"
+            n=$((n+1))
+          done
+          echo "copied $n secrets"
+          m=0
+          for k in $(jq -r 'keys[]' <<<"$ALL_VARS"); do
+            gh variable set "${PREFIX}_$k" --repo "$RUNNER" --body "$(jq -r --arg k "$k" '.[$k]' <<<"$ALL_VARS")"
+            m=$((m+1))
+          done
+          echo "copied $m variables"
+
+      - uses: actions/checkout@v4
+        if: inputs.remove_schedules
+        with:
+          token: ${{ secrets.MIGRATE_TOKEN }}
+
+      - name: Remove the schedules here
+        if: inputs.remove_schedules
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/stshophu/viterbo-runner/main/.github/scripts/remove-schedules.py -o /tmp/rs.py
+          python3 /tmp/rs.py .
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows
+          if git diff --cached --quiet; then echo "no schedules left"; exit 0; fi
+          git commit -qm "Move schedules to the public runner stshophu/viterbo-runner"
+          git push -q
+          echo "schedules removed"
+
+      - name: Switch on the runner copies
+        if: inputs.enable
+        run: gh variable set "${PREFIX}_ENABLED" --repo "$RUNNER" --body true && echo "${PREFIX}_ENABLED=true"
