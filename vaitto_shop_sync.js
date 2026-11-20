@@ -27,6 +27,7 @@
  */
 'use strict';
 const fs = require('fs');
+const crypto = require('crypto');
 const { Client } = (() => { try { return require('pg'); } catch { return {}; } })();
 const { priceRewix } = require('./pricing.cjs');
 
@@ -234,10 +235,11 @@ function eligibleForCreate(p, cfg) {
 // ─── WRITES ────────────────────────────────────────────────────────────────
 const BULK_UPDATE = `mutation($pid:ID!,$v:[ProductVariantsBulkInput!]!){
   productVariantsBulkUpdate(productId:$pid, variants:$v){ userErrors{ field message } } }`;
-const SET_QTY = `mutation($input:InventorySetQuantitiesInput!){
-  inventorySetQuantities(input:$input){ userErrors{ field message code } } }`;
-const ACTIVATE = `mutation($item:ID!,$loc:ID!,$q:Int){
-  inventoryActivate(inventoryItemId:$item, locationId:$loc, available:$q){ userErrors{ field message } } }`;
+// API 2026-04+ requires an idempotency key on the inventory mutations.
+const SET_QTY = `mutation($input:InventorySetQuantitiesInput!,$key:String!){
+  inventorySetQuantities(input:$input) @idempotent(key:$key){ userErrors{ field message code } } }`;
+const ACTIVATE = `mutation($item:ID!,$loc:ID!,$q:Int,$key:String!){
+  inventoryActivate(inventoryItemId:$item, locationId:$loc, available:$q) @idempotent(key:$key){ userErrors{ field message } } }`;
 const CREATE = `mutation($h:String!,$p:ProductSetInput!){
   productSet(identifier:{handle:$h}, input:$p){ product{ id } userErrors{ field message } } }`;
 
@@ -310,12 +312,12 @@ async function main() {
       if (ue.length) errors.push(`${pid}: ${JSON.stringify(ue)}`);
     }
     for (let i = 0; i < qtyChanges.length; i += 100) {
-      const d = await gql(SET_QTY, { input: { name: 'available', reason: 'correction', referenceDocumentUri: 'gid://vaitto/Sync/shop', quantities: qtyChanges.slice(i, i + 100) } });
+      const d = await gql(SET_QTY, { input: { name: 'available', reason: 'correction', referenceDocumentUri: 'gid://vaitto/Sync/shop', quantities: qtyChanges.slice(i, i + 100) }, key: crypto.randomUUID() });
       const ue = d.inventorySetQuantities.userErrors;
       if (ue.length) errors.push(`stock batch ${i}: ${JSON.stringify(ue).slice(0, 300)}`);
     }
     for (const { s, qty } of activations) {
-      const d = await gql(ACTIVATE, { item: s.inventoryItemId, loc: cfg.locationId, q: qty });
+      const d = await gql(ACTIVATE, { item: s.inventoryItemId, loc: cfg.locationId, q: qty, key: crypto.randomUUID() });
       const ue = d.inventoryActivate.userErrors;
       if (ue.length) errors.push(`${s.sku} activate: ${JSON.stringify(ue)}`);
     }
