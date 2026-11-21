@@ -1,0 +1,20 @@
+
+===== step: __run_2  12:57:18
+
+added 15 packages, and audited 16 packages in 724ms
+
+1 package is looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+
+===== step: __run_3  12:57:19
+VAITTO → Shopify sync 
+
+[EU-WAR-6] VAITTO: 4497 products, 6275 variants, data last changed 2026-11-19T09:36:43.758Z
+[EU-WAR-6] Shop: 162 variants tagged VaittoFeed, 162 found in VAITTO
+[EU-WAR-6] Planned: 0 variant updates in 0 products, 0 stock changes, 162 unchanged, 0 new drafts (1552 eligible, limit 0)
+[EU-WAR-6] Written.
+
+Report: vaitto_shop_sync_report.csv (0 rows)
+Done, no errors.
