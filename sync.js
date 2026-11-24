@@ -26,6 +26,7 @@
 require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
+const { classify: classifyFilter } = require('./filter-taxonomy.cjs');
 const { buildTitle, translateCategory, translateSubcategory,
         normalizeMadeIn, normalizeSeason, normalizeGender } = require('./translate.cjs');
 const { fabricMill, fabricTitle, fabricBody, FABRIC_TAG, NO_GOOGLE_TAG, GOOGLE_LABEL_MF } = require('./fabric-brand.cjs');
@@ -370,6 +371,12 @@ function buildShopifyPayload(rp) {
   if (mill)            baseTags.push(FABRIC_TAG, NO_GOOGLE_TAG);
   const allTags   = [...new Set(baseTags)].join(', ');
 
+  // ── Storefront filter fields ─────────────────────────────────
+  // filter.category / filter.subcategory drive the catalog filters. They are
+  // restricted to the values already in use (filter-taxonomy.cjs); if a product
+  // cannot be placed the field is simply not set.
+  const filterCls = classifyFilter({ productType: buildProductType(gender, subcategory, category), title, tags: [category], rewixSub: subcategory });
+
   // ── Metafields ────────────────────────────────────────────────
   // Metafields are included in both create and update payloads. Shopify
   // deduplicates by namespace+key on PUT, so this is safe to send every run.
@@ -382,6 +389,8 @@ function buildShopifyPayload(rp) {
     gender      && { namespace: 'rewix', key: 'gender',      value: gender,                       type: 'single_line_text_field' },
     season      && { namespace: 'rewix', key: 'season',      value: season,                       type: 'single_line_text_field' },
     composition && { namespace: 'rewix', key: 'composition', value: composition,                  type: 'single_line_text_field' },
+    filterCls.category    && { namespace: 'filter', key: 'category',    value: filterCls.category,    type: 'single_line_text_field' },
+    filterCls.subcategory && { namespace: 'filter', key: 'subcategory', value: filterCls.subcategory, type: 'single_line_text_field' },
     mill        && GOOGLE_LABEL_MF,
   ].filter(Boolean);
 
