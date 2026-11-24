@@ -12,13 +12,13 @@
  */
 require('dotenv').config();
 const fs = require('fs');
-const { classify } = require('./filter-taxonomy.cjs');
+const { classify, genderFromTags } = require('./filter-taxonomy.cjs');
 
 const STORE = process.env.SHOPIFY_STORE;
 const TOKEN = process.env.SHOPIFY_TOKEN;
 const API   = '2026-01';
 const APPLY = process.argv.includes('--apply');
-const ONLY_IN_STOCK = !process.argv.includes('--all');
+const ONLY_IN_STOCK = process.argv.includes('--in-stock-only');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = m => console.log(`[${new Date().toISOString()}] ${m}`);
@@ -50,7 +50,7 @@ const Q = `query($q: String!, $after: String) {
   products(first: 100, query: $q, after: $after) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id title productType tags
+      id title status productType tags
       rs: metafield(namespace: "rewix", key: "subcategory") { value }
       fc: metafield(namespace: "filter", key: "category") { value }
       fs: metafield(namespace: "filter", key: "subcategory") { value }
@@ -66,7 +66,7 @@ const csv = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
 
 (async () => {
   for (const k of ['SHOPIFY_STORE', 'SHOPIFY_TOKEN']) if (!process.env[k]) throw new Error(`${k} missing`);
-  const q = 'status:active AND -metafields.filter.category:*' + (ONLY_IN_STOCK ? ' AND inventory_total:>0' : '');
+  const q = '(status:active OR status:draft) AND (-metafields.filter.category:* OR -metafields.filter.subcategory:* OR product_type:\'\')' + (ONLY_IN_STOCK ? ' AND inventory_total:>0' : '');
   log(`${APPLY ? 'APPLY' : 'DRY RUN'} — query: ${q}`);
 
   const rows = [];
@@ -74,29 +74,36 @@ const csv = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
   do {
     const d = await gql(Q, { q, after });
     for (const p of d.products.nodes) {
-      if (p.fc?.value || p.fs?.value) continue; // never overwrite anything
       const r = classify({ productType: p.productType, title: p.title, tags: p.tags, rewixSub: p.rs?.value });
-      rows.push({ id: p.id, title: p.title, productType: p.productType, ...r });
+      // never overwrite: only fill the fields that are empty
+      const newCat = p.fc?.value ? null : r.category;
+      const newSub = p.fs?.value ? null : r.subcategory;
+      const sub = p.fs?.value || r.subcategory;
+      const g = genderFromTags(p.tags);
+      const newType = (!p.productType && sub) ? (g ? `${g} ${sub}` : sub) : null;
+      if (!newCat && !newSub && !newType && (p.fc?.value && p.fs?.value)) continue;
+      rows.push({ id: p.id, title: p.title, productType: p.productType, status: p.status, hadCat: !!p.fc?.value, hadSub: !!p.fs?.value,
+                  category: newCat, subcategory: newSub, newType, source: r.source });
     }
     after = d.products.pageInfo.hasNextPage ? d.products.pageInfo.endCursor : null;
   } while (after);
   log(`candidates: ${rows.length}`);
 
   // report
-  const report = ['product_id,title,product_type,category,subcategory,source'];
-  for (const r of rows) report.push([r.id, r.title, r.productType, r.category, r.subcategory, r.source].map(csv).join(','));
+  const report = ['product_id,title,status,product_type,new_category,new_subcategory,new_product_type,source'];
+  for (const r of rows) report.push([r.id, r.title, r.status, r.productType, r.category, r.subcategory, r.newType, r.source].map(csv).join(','));
   fs.writeFileSync('backfill_filter_report.csv', report.join('\n'));
 
   const byPair = {};
   let both = 0, catOnly = 0, none = 0;
   for (const r of rows) {
-    if (r.category && r.subcategory) both++; else if (r.category) catOnly++; else none++;
-    const k = `${r.category || '-'} / ${r.subcategory || '-'}`;
+    if ((r.category || r.hadCat) && (r.subcategory || r.hadSub)) both++; else if (r.category || r.hadCat) catOnly++; else none++;
+    const k = `${r.category || (r.hadCat ? '(has cat)' : '-')} / ${r.subcategory || (r.hadSub ? '(has sub)' : '-')}`;
     byPair[k] = (byPair[k] || 0) + 1;
   }
   log(`category+subcategory: ${both} | category only: ${catOnly} | unplaced: ${none}`);
   for (const [k, n] of Object.entries(byPair).sort((a, b) => b[1] - a[1])) log(`  ${String(n).padStart(4)}  ${k}`);
-  const unplaced = rows.filter(r => !r.category || !r.subcategory).slice(0, 40);
+  const unplaced = rows.filter(r => !(r.category || r.hadCat) || !(r.subcategory || r.hadSub)).slice(0, 40);
   if (unplaced.length) {
     log('examples not fully placed (productType | title):');
     for (const r of unplaced) log(`  [${r.category || '-'}/${r.subcategory || '-'}] ${r.productType} | ${r.title}`);
@@ -109,6 +116,14 @@ const csv = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
     if (r.category) inputs.push({ ownerId: r.id, namespace: 'filter', key: 'category', type: 'single_line_text_field', value: r.category });
     if (r.subcategory) inputs.push({ ownerId: r.id, namespace: 'filter', key: 'subcategory', type: 'single_line_text_field', value: r.subcategory });
   }
+  const PT = `mutation($i: ProductInput!) { productUpdate(input: $i) { userErrors { field message } } }`;
+  let types = 0;
+  for (const r of rows) {
+    if (!r.newType) continue;
+    const d = await gql(PT, { i: { id: r.id, productType: r.newType } });
+    if (d.productUpdate.userErrors?.length) log(`  type error ${r.id}: ${JSON.stringify(d.productUpdate.userErrors)}`); else types++;
+  }
+  log(`product types set: ${types}`);
   let done = 0, errs = 0;
   for (let i = 0; i < inputs.length; i += 25) {
     const d = await gql(SET, { m: inputs.slice(i, i + 25) });

@@ -39,7 +39,7 @@ const ALIASES = {
   'sandals': 'Sandals', 'sandal': 'Sandals', 'heel sandals': 'Heeled Sandals',
   'heeled sandals': 'Heeled Sandals', 'flip-flops': 'Sandals', 'flip flops': 'Sandals',
   'pumps heels': 'Pumps', 'pumps': 'Pumps', 'pump': 'Pumps', 'heels': 'Pumps',
-  'flats': 'Flats', 'ballerinas': 'Flats', 'loafers': 'Loafers', 'loafer': 'Loafers',
+  'flats': 'Flats', 'flat shoes': 'Flats', 'flat shoes': 'Flats', 'ballerinas': 'Flats', 'loafers': 'Loafers', 'loafer': 'Loafers',
   'mules': 'Mules', 'slippers': 'Slippers', 'espadrilles': 'Espadrilles', 'espadrillas': 'Espadrilles',
   'backpacks': 'Backpacks', 'backpack': 'Backpacks', 'small backpacks': 'Backpacks',
   'clutches': 'Clutches', 'clutch': 'Clutches',
@@ -66,7 +66,7 @@ const ALIASES = {
   'polo shirts': 'Polo Shirts', 'polo': 'Polo Shirts',
   'shirts': 'Shirts', 'shirt': 'Shirts', 'blouses': 'Shirts', 'blouse': 'Shirts',
   'shorts': 'Shorts', 'bermuda': 'Shorts', 'skirts': 'Skirts', 'skirt': 'Skirts',
-  'suits': 'Suits', 'sweaters': 'Sweaters', 'sweater': 'Sweaters', 'jumper': 'Sweaters',
+  'suits': 'Suits', 'sweaters': 'Sweaters', 'sweater': 'Sweaters', 'jumper': 'Sweaters', 'pullover': 'Sweaters', 'turtleneck': 'Sweaters',
   'sweatshirts': 'Sweatshirts', 'sweatshirt': 'Sweatshirts', 'hoodie': 'Sweatshirts',
   'swimwear': 'Swimwear', 't-shirts': 'T-Shirts', 't-shirt': 'T-Shirts',
   't-shirts & tops': 'T-Shirts', 'tops': 'Tops', 'top': 'Tops',
@@ -132,4 +132,15 @@ function classify(p) {
   return { category, subcategory: sub, source: source || 'none' };
 }
 
-module.exports = { classify, SUB_TO_CAT };
+function genderFromTags(tags) {
+  for (const t of tags || []) {
+    const k = norm(t);
+    if (k === 'woman' || k === 'women') return 'Women';
+    if (k === 'man' || k === 'men') return 'Men';
+    if (k === 'junior' || k === 'kids') return 'Junior';
+    if (k === 'unisex') return 'Unisex';
+  }
+  return null;
+}
+
+module.exports = { classify, genderFromTags, SUB_TO_CAT };

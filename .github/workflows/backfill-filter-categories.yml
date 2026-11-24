@@ -7,8 +7,8 @@ on:
         description: "Type 'apply' to write the metafields. Leave blank for a dry run."
         required: false
         default: ''
-      all_products:
-        description: "Type 'all' to include out-of-stock products too (default: in-stock only)."
+      in_stock_only:
+        description: "Type 'yes' to limit to in-stock products (default: all active + draft products)."
         required: false
         default: ''
 
@@ -29,7 +29,7 @@ jobs:
         run: |
           ARGS=""
           if [ "${{ github.event.inputs.apply }}" = "apply" ]; then ARGS="$ARGS --apply"; fi
-          if [ "${{ github.event.inputs.all_products }}" = "all" ]; then ARGS="$ARGS --all"; fi
+          if [ "${{ github.event.inputs.in_stock_only }}" = "yes" ]; then ARGS="$ARGS --in-stock-only"; fi
           node backfill_filter_categories.cjs $ARGS
       - name: Upload report
         if: always()
