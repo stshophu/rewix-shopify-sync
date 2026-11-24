@@ -518,18 +518,25 @@ async function loadShopifyIndex() {
  * otherwise left alone after import; this one is kept current because the
  * UVP comes from the feed's full price. No-op without a positive value.
  */
+const rrpQueue = [];
+async function flushRrpQueue() {
+  while (rrpQueue.length) {
+    const batch = rrpQueue.splice(0, 25);   // metafieldsSet accepts up to 25 per call
+    const query = 'mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }';
+    const res = await shopifyFetch(`${shopifyBase()}/graphql.json`, {
+      method: 'POST', headers: shopifyHeaders(), body: JSON.stringify({ query, variables: { m: batch } }),
+    });
+    if (!res.ok) { warn(`rrp metafield batch failed: HTTP ${res.status}`); continue; }
+    const j = await res.json().catch(() => ({}));
+    const errs = j?.data?.metafieldsSet?.userErrors || j?.errors;
+    if (errs && errs.length) warn(`rrp metafield batch errors: ${JSON.stringify(errs)}`);
+  }
+}
 async function setRrpMetafield(productId, rrp) {
   if (!productId || !(rrp > 0)) return;
-  const query = 'mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }';
-  const variables = { m: [{ ownerId: `gid://shopify/Product/${productId}`, namespace: 'custom',
-                            key: 'rrp', type: 'number_decimal', value: rrp.toFixed(2) }] };
-  const res = await shopifyFetch(`${shopifyBase()}/graphql.json`, {
-    method: 'POST', headers: shopifyHeaders(), body: JSON.stringify({ query, variables }),
-  });
-  if (!res.ok) { warn(`rrp metafield failed (${productId}): HTTP ${res.status}`); return; }
-  const j = await res.json().catch(() => ({}));
-  const errs = j?.data?.metafieldsSet?.userErrors || j?.errors;
-  if (errs && errs.length) warn(`rrp metafield errors (${productId}): ${JSON.stringify(errs)}`);
+  rrpQueue.push({ ownerId: `gid://shopify/Product/${productId}`, namespace: 'custom',
+                  key: 'rrp', type: 'number_decimal', value: rrp.toFixed(2) });
+  if (rrpQueue.length >= 25) await flushRrpQueue();
 }
 
 async function createShopifyProduct(payload) {
@@ -1173,6 +1180,8 @@ async function run() {
       log(`Progress: ${i + 1}/${products.length} | ✅ created:${created} updated:${updated} skipped:${skipped} ❌ failed:${failed}`);
     }
   }
+
+  await flushRrpQueue();
 
   // Location sweep: every RewixSync variant must live at 3169 only. On the
   // first run this removes the Hanau links (and their phantom stock) from the
