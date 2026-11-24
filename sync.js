@@ -380,7 +380,11 @@ function buildShopifyPayload(rp) {
   // ── Metafields ────────────────────────────────────────────────
   // Metafields are included in both create and update payloads. Shopify
   // deduplicates by namespace+key on PUT, so this is safe to send every run.
+  // UVP (full Italian retail price = Rewix streetPrice) as custom.rrp, shown in
+  // the shop as plain info. Highest value across the sizes of the product.
+  const rrpMax = Math.max(0, ...variants.map(v => parseFloat(v.compare_at_price) || 0));
   const metafields = [
+    rrpMax > 0 && { namespace: 'custom', key: 'rrp', value: rrpMax.toFixed(2), type: 'number_decimal' },
     { namespace: 'rewix', key: 'product_code',  value: rp.code,                          type: 'single_line_text_field' },
     { namespace: 'rewix', key: 'product_id',    value: String(rp.id),                    type: 'single_line_text_field' },
     rp.hs       && { namespace: 'rewix', key: 'hs_code',     value: rp.hs,                        type: 'single_line_text_field' },
@@ -507,6 +511,25 @@ async function loadShopifyIndex() {
   const rewixSyncCount = modelIdToData.size;
   log(`Shopify index built: ${skuVariantId.size} variants indexed (${rewixSyncCount} from RewixSync app).`);
   return { skuToProductId, skuVariantId, modelIdToData, productMeta, skuData };
+}
+
+/**
+ * Set the UVP metafield (custom.rrp) on an existing product. Metafields are
+ * otherwise left alone after import; this one is kept current because the
+ * UVP comes from the feed's full price. No-op without a positive value.
+ */
+async function setRrpMetafield(productId, rrp) {
+  if (!productId || !(rrp > 0)) return;
+  const query = 'mutation($m: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $m) { userErrors { field message } } }';
+  const variables = { m: [{ ownerId: `gid://shopify/Product/${productId}`, namespace: 'custom',
+                            key: 'rrp', type: 'number_decimal', value: rrp.toFixed(2) }] };
+  const res = await shopifyFetch(`${shopifyBase()}/graphql.json`, {
+    method: 'POST', headers: shopifyHeaders(), body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) { warn(`rrp metafield failed (${productId}): HTTP ${res.status}`); return; }
+  const j = await res.json().catch(() => ({}));
+  const errs = j?.data?.metafieldsSet?.userErrors || j?.errors;
+  if (errs && errs.length) warn(`rrp metafield errors (${productId}): ${JSON.stringify(errs)}`);
 }
 
 async function createShopifyProduct(payload) {
@@ -1134,6 +1157,9 @@ async function run() {
             await updateVariantInventory(vid, m.availability ?? 0, cost, warehouseLocationId);
           }
         }
+        // UVP metafield (custom.rrp) from the feed's full price
+        const rrpNow = Math.max(0, ...payload.product.variants.map(v => parseFloat(v.compare_at_price) || 0));
+        await setRrpMetafield(existingId, rrpNow);
         updated++;
       }
 
