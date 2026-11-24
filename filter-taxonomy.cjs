@@ -132,4 +132,15 @@ function classify(p) {
   return { category, subcategory: sub, source: source || 'none' };
 }
 
-module.exports = { classify, SUB_TO_CAT };
+function genderFromTags(tags) {
+  for (const t of tags || []) {
+    const k = norm(t);
+    if (k === 'woman' || k === 'women') return 'Women';
+    if (k === 'man' || k === 'men') return 'Men';
+    if (k === 'junior' || k === 'kids') return 'Junior';
+    if (k === 'unisex') return 'Unisex';
+  }
+  return null;
+}
+
+module.exports = { classify, genderFromTags, SUB_TO_CAT };
