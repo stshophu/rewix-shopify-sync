@@ -177,42 +177,50 @@ const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(
 const SUB_TYPE = { Shoulder: 'Shoulder Bags', Crossbody: 'Crossbody Bags', Tote: 'Tote Bags', Backpack: 'Backpacks', Clutch: 'Clutches' };
 
 // ─── SIEBENTASCHEN TAXONOMY (VAITTO category/subcategory → shop fields) ────
-// VAITTO's trigger fills category/subcategory; here they are translated into the
-// shop's filter.* / custom.* / google.* metafields, same wording as Rewix products.
-const FILTER_SUB = { Shoulder: 'Shoulder Bags', Crossbody: 'Crossbody Bags', Tote: 'Tote Bags', Backpack: 'Backpacks',
-  Clutch: 'Clutches', 'T-shirts & Tops': 'T-Shirts', 'Down Jackets': 'Down Jackets' };
+// VAITTO's trigger fills category/subcategory; the shop's own mapper (filter-taxonomy.cjs,
+// shared with the Rewix sync) turns them into values that already exist in the storefront
+// filter. Anything it cannot place stays empty (never a guess).
+const { classify } = require('./filter-taxonomy.cjs');
+const VAITTO_SUB = { Shoulder: 'Shoulder Bags', Crossbody: 'Crossbody Bags', Backpack: 'Backpacks', Clutch: 'Clutches',
+  Tote: 'Handbags', 'T-shirts & Tops': 'T-Shirts', Sweatshirt: 'Sweatshirts', Pants: 'Trousers' };
+function shopClass(p, productType, tags) {
+  return classify({ productType, title: p.name, tags,
+    rewixSub: VAITTO_SUB[p.subcategory] || p.subcategory });
+}
 const G = 'Apparel & Accessories > ';
 const GOOGLE_BY_SUB = {
   Coats: G + 'Clothing > Outerwear > Coats & Jackets', Jackets: G + 'Clothing > Outerwear > Coats & Jackets',
-  'Down Jackets': G + 'Clothing > Outerwear > Coats & Jackets', Vests: G + 'Clothing > Outerwear > Vests',
-  Knitwear: G + 'Clothing > Sweaters', Dresses: G + 'Clothing > Dresses', Skirts: G + 'Clothing > Skirts',
-  Pants: G + 'Clothing > Pants', Jeans: G + 'Clothing > Jeans', Shorts: G + 'Clothing > Shorts',
-  Shirts: G + 'Clothing > Shirts & Tops', 'T-shirts & Tops': G + 'Clothing > Shirts & Tops',
-  Scarves: G + 'Clothing Accessories > Scarves & Shawls', Hats: G + 'Clothing Accessories > Hats',
-  Gloves: G + 'Clothing Accessories > Gloves & Mittens', Belts: G + 'Clothing Accessories > Belts',
-  Sunglasses: G + 'Clothing Accessories > Sunglasses', Backpack: 'Luggage & Bags > Backpacks',
-  Luggage: 'Luggage & Bags > Suitcases', Wallets: G + 'Handbags, Wallets & Cases > Wallets & Money Clips',
-  Rings: G + 'Jewelry > Rings', Bracelets: G + 'Jewelry > Bracelets', Necklaces: G + 'Jewelry > Necklaces',
-  Earrings: G + 'Jewelry > Earrings', Charms: G + 'Jewelry > Charms & Pendants',
+  'Down Jackets': G + 'Clothing > Outerwear > Coats & Jackets', Blazers: G + 'Clothing > Outerwear > Coats & Jackets',
+  Vests: G + 'Clothing > Outerwear > Vests', Knitwear: G + 'Clothing > Sweaters', Sweaters: G + 'Clothing > Sweaters',
+  Dresses: G + 'Clothing > Dresses', Skirts: G + 'Clothing > Skirts', Trousers: G + 'Clothing > Pants',
+  Jeans: G + 'Clothing > Jeans', Shorts: G + 'Clothing > Shorts', Shirts: G + 'Clothing > Shirts & Tops',
+  'T-Shirts': G + 'Clothing > Shirts & Tops', Tops: G + 'Clothing > Shirts & Tops', 'Polo Shirts': G + 'Clothing > Shirts & Tops',
+  Sweatshirts: G + 'Clothing > Activewear', Scarves: G + 'Clothing Accessories > Scarves & Shawls',
+  Hats: G + 'Clothing Accessories > Hats', Gloves: G + 'Clothing Accessories > Gloves & Mittens',
+  Belts: G + 'Clothing Accessories > Belts', Sunglasses: G + 'Clothing Accessories > Sunglasses',
+  Backpacks: 'Luggage & Bags > Backpacks', 'Travel Bags': 'Luggage & Bags > Duffel Bags',
+  Wallets: G + 'Handbags, Wallets & Cases > Wallets & Money Clips',
+  'Ankle Boots': G + 'Shoes > Boots', Boots: G + 'Shoes > Boots',
 };
-const GOOGLE_BY_CAT = { Bags: G + 'Handbags, Wallets & Cases > Handbags', Shoes: G + 'Shoes', Clothing: G + 'Clothing',
-  Accessories: G + 'Clothing Accessories', Jewelry: G + 'Jewelry' };
-const googleCategory = p => GOOGLE_BY_SUB[p.subcategory] || GOOGLE_BY_CAT[p.category] || null;
+const GOOGLE_BY_CAT = { Bags: G + 'Handbags, Wallets & Cases > Handbags', Shoes: G + 'Shoes',
+  Clothing: G + 'Clothing', Accessories: G + 'Clothing Accessories' };
+const googleCategory = c => GOOGLE_BY_SUB[c.subcategory] || GOOGLE_BY_CAT[c.category] || null;
 const googleGender = p => (p.gender === 'Women' ? 'female' : p.gender === 'Men' ? 'male' : 'unisex');
 
-// Shop size filter value. VAITTO sizes are already cleaned (One Size, 36.5, 3XL, 39-40).
+// Shop size filter value (format as seen on Rewix variants: "EU 38", "XL", "M").
+// VAITTO sizes are already cleaned (One Size, 36.5, 3XL, 39-40).
 // Shoes: EU as is; US women's → EU (approx. US+30). Clothing: letter sizes as is;
 // bare numbers are ambiguous (IT vs US) → left empty rather than guessed.
-function filterSize(p, size) {
+function filterSize(category, size) {
   const s = sizeFix(size);
-  if (p.category === 'Shoes') {
+  if (category === 'Shoes') {
     const us = s.match(/^US\s*(\d+(?:\.\d+)?)$/i);
     if (us) return 'EU ' + (parseFloat(us[1]) + 30);
     if (/^\d{2}(\.5)?$/.test(s) && +s >= 33 && +s <= 47) return 'EU ' + s;
     return null;
   }
-  if (p.category === 'Clothing') return /^(\d?X{0,3}[SL]|XS|M|XS\/S|S\/M|M\/L|L\/XL|One Size)$/i.test(s) ? s : null;
-  return s;
+  if (category === 'Clothing') return /^(\d?X{0,3}[SL]|XS|M|XS\/S|S\/M|M\/L|L\/XL|One Size)$/i.test(s) ? s : null;
+  return (category === 'Bags' || category === 'Accessories') ? s : null;
 }
 
 function buildNewProduct(p, cfg) {
@@ -224,6 +232,8 @@ function buildNewProduct(p, cfg) {
   const productType = (p.gender === 'Women' ? 'Women ' : p.gender === 'Men' ? 'Men ' : '') + sub;
   const grams = (p.category === 'Coats' || /\b(coat|cape|down jacket|winter jacket|parka|puffer)\b/i.test(p.name)) ? WEIGHT_GRAMS.Coats : (WEIGHT_GRAMS[p.category] || 600);
   const lines = String(p.description || '').split('\n').map(s => s.trim()).filter(Boolean);
+  const tags = [p.category, brand, g || 'Unisex', p.subcategory, p.season, ...cfg.tags].filter(Boolean);
+  const cls = shopClass(p, productType, tags);
   const vmap = new Map();
   for (const v of p.variants) {
     const key = colFix(v.colour) + '|' + sizeFix(v.size);
@@ -237,7 +247,7 @@ function buildNewProduct(p, cfg) {
       sku: v.sku, price: t.price, ...(t.compareAt ? { compareAtPrice: t.compareAt } : {}),
       ...(validBarcode(v.barcode) ? { barcodes: [{ value: String(v.barcode).trim() }] } : {}),
       optionValues: [{ optionName: 'Color', name: colFix(v.colour) }, { optionName: 'Size', name: sizeFix(v.size) }],
-      ...(filterSize(p, v.size) ? { metafields: [{ namespace: 'filter', key: 'size', type: 'single_line_text_field', value: filterSize(p, v.size) }] } : {}),
+      ...(filterSize(cls.category, v.size) ? { metafields: [{ namespace: 'filter', key: 'size', type: 'single_line_text_field', value: filterSize(cls.category, v.size) }] } : {}),
       inventoryPolicy: 'DENY',
       inventoryItem: { tracked: true, cost: t.cost, measurement: { weight: { value: grams / 1000, unit: 'KILOGRAMS' } } },
       inventoryQuantities: [{ locationId: cfg.locationId, name: 'available', quantity: t.qty }],
@@ -247,7 +257,7 @@ function buildNewProduct(p, cfg) {
     title, handle: slug(title) + '-' + slug(String(p.vaitto_sku || p.id)),
     vendor: brand, productType, status: 'DRAFT',
     descriptionHtml: `<p>${esc(title)}.</p>` + (lines.length ? '<ul>' + lines.map(l => `<li>${esc(l)}</li>`).join('') + '</ul>' : ''),
-    tags: [p.category, brand, g || 'Unisex', p.subcategory, p.season, ...cfg.tags].filter(Boolean),
+    tags,
     productOptions: [
       { name: 'Color', values: [...new Set(vs.map(v => colFix(v.colour)))].map(name => ({ name })) },
       { name: 'Size', values: [...new Set(vs.map(v => sizeFix(v.size)))].map(name => ({ name })) },
@@ -256,12 +266,12 @@ function buildNewProduct(p, cfg) {
     metafields: [
       { namespace: 'vaitto', key: 'product_id', type: 'single_line_text_field', value: p.id },
       { namespace: 'vaitto', key: 'sku', type: 'single_line_text_field', value: String(p.vaitto_sku || '') },
-      ...(p.category ? [
-        { namespace: 'filter', key: 'category', type: 'single_line_text_field', value: p.category },
-        { namespace: 'custom', key: 'category', type: 'single_line_text_field', value: p.category },
+      ...(cls.category ? [
+        { namespace: 'filter', key: 'category', type: 'single_line_text_field', value: cls.category },
+        { namespace: 'custom', key: 'category', type: 'single_line_text_field', value: cls.category },
       ] : []),
-      ...(p.subcategory ? [{ namespace: 'filter', key: 'subcategory', type: 'single_line_text_field', value: FILTER_SUB[p.subcategory] || p.subcategory }] : []),
-      ...(googleCategory(p) ? [{ namespace: 'custom', key: 'google_product_category', type: 'single_line_text_field', value: googleCategory(p) }] : []),
+      ...(cls.subcategory ? [{ namespace: 'filter', key: 'subcategory', type: 'single_line_text_field', value: cls.subcategory }] : []),
+      ...(googleCategory(cls) ? [{ namespace: 'custom', key: 'google_product_category', type: 'single_line_text_field', value: googleCategory(cls) }] : []),
       { namespace: 'google', key: 'gender', type: 'single_line_text_field', value: googleGender(p) },
     ],
     variants,
